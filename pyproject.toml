@@ -1,0 +1,7 @@
+[project]
+name = "blendermodel"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "codebuddy-agent-sdk>=0.3.299",
+]

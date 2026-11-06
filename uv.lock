@@ -1,0 +1,63 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "anyio"
+version = "4.16.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "idna" },
+    { name = "typing-extensions", marker = "python_full_version < '3.15'" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/a1/98/7e457a3b014976887a050561955c0b76e1e7e2d6e27b78ecef2ef80518f2/anyio-4.16.0.tar.gz", hash = "sha256:59bb03251907983d1603d27c3087ddb1e93299ea2163adcdba37899a4fb12ffb" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/a9/16/7757fb84c819accc7d7e9af5291b261e4abb8627ee040f99e7d35ef2457a/anyio-4.16.0-py3-none-any.whl", hash = "sha256:c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026" },
+]
+
+[[package]]
+name = "blendermodel"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "codebuddy-agent-sdk" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "codebuddy-agent-sdk", specifier = ">=0.3.299" }]
+
+[[package]]
+name = "codebuddy-agent-sdk"
+version = "0.3.299"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "anyio" },
+    { name = "typing-extensions" },
+]
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/28/82/136a6254d1858ccdb75be8a5de01e30d7bf2e44db60a358f4dffd47ec2ef/codebuddy_agent_sdk-0.3.299-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:ed574367ec4a8cf890bd2b1c254d1866612ddaadb3d0d01bfd10ecc43a9463f0" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/3b/40/02aafb530fa9c1a91a43d36671e256e93a6e0105a9fb91177da16851db77/codebuddy_agent_sdk-0.3.299-py3-none-macosx_11_0_arm64.whl", hash = "sha256:aaa9e0c95b98d6522f91974b90f2ae069edb62018a81f04db9382e76adedb0cf" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/63/14/46d2bebf869ce9a7e56c8394e36ca3e1c0982a5d3ace39e58a07abb25766/codebuddy_agent_sdk-0.3.299-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:33edfc85458eabc499d991e16f33cefd78118f344d2a6273c5848a3b08c548e8" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/8f/5f/acc6c51f59db475a924de793173cd3bbf8402de967105d47cb0fe3186bfd/codebuddy_agent_sdk-0.3.299-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:88fc43ae4719d914ca24a684dc7f42b272dcc1afb053807b19e0207176fc4200" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/2a/20/fee5d2a134717a7a7af59de0e2ffc435b326923d34274b3a598ded429d53/codebuddy_agent_sdk-0.3.299-py3-none-musllinux_1_1_aarch64.whl", hash = "sha256:78c281127391e10d0fb945acce5bd17204bda4a28dfe033f8b79a893c56a8223" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/a4/eb/11c445c80a76c302871107f06d6792c86669a13c4a812cce80ef66a33e72/codebuddy_agent_sdk-0.3.299-py3-none-musllinux_1_1_x86_64.whl", hash = "sha256:2d874d309d91deb9f10283032d8b3c4948172af9e502f8656180ba751e834fba" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/29/b1/4b4047ddada4c352f66fef5f1f8d715db78994c847481b67665f9cfcbc3b/codebuddy_agent_sdk-0.3.299-py3-none-win_amd64.whl", hash = "sha256:ea0ac7dd46ed8c70927ddd2ee8b2a9a70600bb2b49c96edebf7c97c29f270d86" },
+]
+
+[[package]]
+name = "idna"
+version = "3.20"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/f5/08/8eea9d4b8302028f3abb2c0813953f7aec26d33b7a8960ed760e65ff29fa/idna-3.20.tar.gz", hash = "sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/58/a2/bb081bab032533a855d44de1d56f8e8426114ff1ba5d1f07a438a0a654f8/idna-3.20-py3-none-any.whl", hash = "sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c" },
+]
+
+[[package]]
+name = "typing-extensions"
+version = "4.16.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/f6/cc/6253133b5bb138fc3306cebfbda2c520f545d36b5be2c7255cc528bb45d6/typing_extensions-4.16.0.tar.gz", hash = "sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8" },
+]
