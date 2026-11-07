@@ -41,7 +41,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 
 1. **Hello, query()** — 消息流、3 类消息、`CodeBuddyAgentOptions` 初见 ← 案例 01
 2. Options 全景 & 环境隔离 `setting_sources` ← 案例 02
-3. 让 Agent 干活：工具白名单、`ToolUseBlock`、只读分析项目
+3. 让 Agent 干活：工具白名单、`ToolUseBlock`、只读分析项目 ← 案例 03
 4. 多轮对话：`CodeBuddySDKClient` + `receive_response`
 5. 会话持久化：`session_id` / `resume` / `continue_conversation`
 6. 权限控制：`can_use_tool` 白名单与危险命令拦截
@@ -353,6 +353,159 @@ init 快照片段（实测）：
 
 ---
 
+## 案例 03 · 让 Agent 干活：工具白名单与只读分析
+
+难度：★★★☆☆
+目标：让 Agent 真正调用工具完成任务，看清 `ToolUseBlock` → `ToolResultBlock` 的完整轨迹，并验证工具白名单是否生效。
+
+可运行文件：[`cases/03_readonly_analysis.py`](../cases/03_readonly_analysis.py)。本例发起 1 次真实模型调用（内部含多个工具轮次），复用 [`cases/_common/sdk_helpers.py`](../cases/_common/sdk_helpers.py) 的 `brief()` 与 `dump_message()`。
+
+### 知识点：三种工具控制字段
+
+| 字段 | 作用 | 层次 |
+|---|---|---|
+| `tools` | **从根本上限定内置工具集**；`tools=[]` 禁用全部内置工具（仅留 MCP 工具） | 改模型可见的工具 schema，最彻底 |
+| `allowed_tools` | 自动批准白名单（支持模式匹配），**不缩小**工具集 | 权限层 |
+| `disallowed_tools` | 禁止使用的工具（支持模式匹配） | 权限层 |
+
+本例用 `tools=["Read","Glob","Grep"]` 加 `permission_mode="plan"`（只读）做双保险。`can_use_tool` 细粒度回调留到案例 6。
+
+### 消息流的完整形状（本例实测）
+
+```
+SystemMessage(init)                     ← data.tools 是 CLI 全部可用工具（66 项）
+AssistantMessage [TextBlock]            ← "三个只读操作互不依赖，并行执行"
+AssistantMessage [ToolUseBlock × 3]     ← 一轮并行发出 3 个工具调用
+UserMessage      [ToolResultBlock × 3]  ← 工具结果统一以 user 角色回来
+AssistantMessage [TextBlock]            ← 最终汇总
+ResultMessage                           ← 统计
+```
+
+三个要点：
+
+- `ToolUseBlock` 在 `AssistantMessage`，`ToolResultBlock` 在 `UserMessage`（案例 01 修正过的坑）。
+- 模型可以**一轮发多个 `ToolUseBlock` 并行执行**，结果一起回来——别假设「一次调用对应一次结果」。
+- **`init.tools` 不代表模型实际可用集**：实测设了 `tools=["Read","Glob","Grep"]` 后 init 仍列 66 项，但实际调用只有那 3 个。验证白名单要看实际调用的工具名，不是看 init 快照。
+
+### 代码
+
+```python
+"""案例 03 · 让 Agent 干活：工具白名单与只读分析"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from codebuddy_agent_sdk import (
+    AssistantMessage,
+    CodeBuddyAgentOptions,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+    query,
+)
+from _common.sdk_helpers import brief, dump_message
+
+PROJECT = Path(__file__).resolve().parent.parent
+WHITELIST = {"Read", "Glob", "Grep"}
+
+PROMPT = """请只读分析当前项目，完成三件事：
+1. 用 Glob 列出 cases/ 下所有 .py 文件；
+2. 用 Read 读取 pyproject.toml，告诉我依赖的 SDK 及版本要求；
+3. 用 Grep 找出 cases/ 下 import 了 ToolUseBlock 的文件。
+最后用简短中文汇总。不要修改任何文件。"""
+
+
+async def main() -> None:
+    options = CodeBuddyAgentOptions(
+        cwd=str(PROJECT),
+        permission_mode="plan",          # 只读模式，双保险
+        max_turns=8,                     # 工具轮次上限，防止跑飞
+        tools=["Read", "Glob", "Grep"],  # 只暴露这 3 个内置工具
+    )
+
+    used: list[str] = []
+    step = 0
+    print(f"=== 白名单 tools={sorted(WHITELIST)} ===\n")
+
+    async for message in query(prompt=PROMPT, options=options):
+
+        # ① init：注意 tools 字段是 CLI 全部可用工具，不代表模型实际可用集
+        if isinstance(message, SystemMessage) and message.subtype == "init":
+            all_tools = message.data.get("tools") or []
+            print(f"[init] CLI 全部可用工具 {len(all_tools)} 项（不代表模型可用集）")
+
+        # ② 助手消息：ToolUseBlock 在这里；最终文本也在这里
+        elif isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, ToolUseBlock):
+                    step += 1
+                    used.append(block.name)
+                    print(f"  {step}. [调用] {block.name}({brief(block.input)})")
+                elif isinstance(block, TextBlock) and block.text.strip():
+                    print(f"\n[回答] {block.text.strip()}")
+
+        # ③ 工具结果走 UserMessage（tool_result 属于 user 角色）
+        elif isinstance(message, UserMessage) and isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    print(f"       [结果] {brief(block.content)}")
+
+        # ④ 收尾统计
+        elif isinstance(message, ResultMessage):
+            dump_message(message, max_len=400)
+
+    print("\n=== 白名单校验 ===")
+    print(f"  实际调用: {used}")
+    print(f"  越界工具: {sorted(set(used) - WHITELIST) or '无'}")
+    print(f"  结论: {'通过 ✓' if set(used) <= WHITELIST else '未通过 ✗'}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 运行与实测输出
+
+```bash
+uv run python cases/03_readonly_analysis.py
+```
+
+```
+=== 白名单 tools=['Glob', 'Grep', 'Read'] ===
+[init] CLI 全部可用工具 66 项（不代表模型可用集）
+[回答] 三个只读操作互不依赖，并行执行。
+  1. [调用] Glob({'pattern': 'cases/**/*.py'})
+  2. [调用] Read({'file_path': '.../pyproject.toml'})
+  3. [调用] Grep({'pattern': 'import.*ToolUseBlock|from.*ToolUseBlock', ...})
+       [结果] [{'type': 'text', 'text': '[".../01_hello_query.py",".../0…(共 271 字符)
+       [结果] [{'type': 'text', 'text': '   1→[project]\n   2→name = "blendermodel"…(共 209 字符)
+       [结果] [{'type': 'text', 'text': '[".../03_readonly_analysis.py"]'}]
+[回答] ## 只读分析汇总 …（略）
+=== 白名单校验 ===
+  实际调用: ['Glob', 'Read', 'Grep']
+  越界工具: 无
+  结论: 通过 ✓
+```
+
+### 三个值得注意的观察
+
+1. **白名单确实生效**：`init.tools` 是 66 项，但实际调用严格落在 3 个工具内。所以判断 `tools` 是否生效要看调用轨迹，不能看 init。
+2. **`num_turns=11` 而 `max_turns=8`**：两者计数口径不同（`num_turns` 把工具结果轮次也算进去），别拿它们直接对比来推断「是否超限」。
+3. **工具结果要自己核对**：模型自己写的 Grep 正则只匹配了单行 `import`，漏掉了案例 01 里多行 `from ... import (...)` 形式的 `ToolUseBlock`，所以汇总里只报了 1 个文件。Agent 给出的检索结论不等于事实——这正是做只读分析时该复核的地方。
+
+### 思考题
+
+- 把 `tools` 改成 `[]`，看模型还能不能完成任务、会怎么回应。
+- 去掉 `tools` 但保留 `permission_mode="plan"`，观察模型会不会改用 `Bash`。
+- 把 `max_turns` 调到 2，看被截断时的 `ResultMessage.subtype` 与 `errors`。
+
+---
+
 ## 环境信息
 
 | 项 | 值 |
@@ -364,4 +517,4 @@ init 快照片段（实测）：
 
 ## 下一步
 
-案例 3：让 Agent 干活——工具白名单、`ToolUseBlock`、只读分析项目。
+案例 4：多轮对话——`CodeBuddySDKClient` + `receive_response()`。

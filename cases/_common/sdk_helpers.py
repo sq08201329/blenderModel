@@ -17,6 +17,8 @@ sys.path，因此脚本里可直接 import：
     async for msg in dump_stream(query(prompt="...", options=opts)):
         ...
 
+另有 `brief()` 把任意值压成单行摘要，适合打印工具入参/结果。
+
 说明：所有 Message 都是 dataclass，`asdict()` 能递归展开嵌套的
 content block，因此下面不会漏字段；`ensure_ascii=False` 保证中文可读。
 """
@@ -51,6 +53,12 @@ def dump_message(msg: Any, *, indent: int = 2, max_len: int | None = None) -> No
     if max_len is not None and len(text) > max_len:
         text = text[:max_len] + f"\n... (截断，共 {len(text)} 字符)"
     print(text)
+
+
+def brief(value: Any, limit: int = 120) -> str:
+    """把任意值压成单行摘要，用于打印工具入参/结果，避免长输出刷屏。"""
+    text = str(value).replace("\n", "\\n")
+    return text if len(text) <= limit else text[:limit] + f"…(共 {len(text)} 字符)"
 
 
 async def dump_stream(
