@@ -29,6 +29,7 @@ uv run python cases/01_hello_query.py
 ```
 cases/
   01_hello_query.py        # 案例 01：query() 消息流
+  02_options_and_settings.py  # 案例 02：Options 全景与 setting_sources
   _common/
     sdk_helpers.py         # 公共函数：format_message / dump_message / dump_stream
 docs/
@@ -41,8 +42,8 @@ pyproject.toml / uv.lock   # UV 项目与锁定依赖
 
 ## 课程进度
 
-案例 **01** 已完成：`query()` 基础用法、消息流分层、`CodeBuddyAgentOptions` 初见。
-案例 02–10（Options 与环境隔离、多轮对话、会话恢复、权限控制、Hooks、自定义 Agent、自定义工具/MCP、综合实战）待补充，完整大纲见教程文档。
+案例 **01–02** 已完成：消息流分层、`query()` 基础用法、Options 全景、`setting_sources` 环境隔离。
+案例 03–10（让 Agent 干活、多轮对话、会话恢复、权限控制、Hooks、自定义 Agent、自定义工具/MCP、综合实战）待补充，完整大纲见教程文档。
 
 ## 几个已验证的要点
 
