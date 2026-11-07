@@ -42,7 +42,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 1. **Hello, query()** — 消息流、3 类消息、`CodeBuddyAgentOptions` 初见 ← 案例 01
 2. Options 全景 & 环境隔离 `setting_sources` ← 案例 02
 3. 让 Agent 干活：工具白名单、`ToolUseBlock`、只读分析项目 ← 案例 03
-4. 多轮对话：`CodeBuddySDKClient` + `receive_response`
+4. 多轮对话：`CodeBuddySDKClient` + `receive_response` ← 案例 04
 5. 会话持久化：`session_id` / `resume` / `continue_conversation`
 6. 权限控制：`can_use_tool` 白名单与危险命令拦截
 7. Hook 系统：`PreToolUse` 审计与阻断
@@ -504,6 +504,185 @@ uv run python cases/03_readonly_analysis.py
 - 去掉 `tools` 但保留 `permission_mode="plan"`，观察模型会不会改用 `Bash`。
 - 把 `max_turns` 调到 2，看被截断时的 `ResultMessage.subtype` 与 `errors`。
 
+> 案例 04 正好用上了 `tools=[]`——不过目的不同：那里是为了**阻止模型读历史 transcript**，避免把「搜到的信息」误当成「会话上下文」。
+
+---
+
+## 案例 04 · 多轮对话：CodeBuddySDKClient
+
+难度：★★★☆☆
+目标：理解 `query()` 是一次性单轮，多轮交互必须用 `CodeBuddySDKClient`；用 A/B 对比看到会话是否共享。
+
+可运行文件：[`cases/04_multi_turn.py`](../cases/04_multi_turn.py)。本例发起 4 次真实模型调用，复用 `brief()`。
+
+### 知识点：`query()` vs `CodeBuddySDKClient`
+
+| | `query()` | `CodeBuddySDKClient` |
+|---|---|---|
+| 会话 | 每次调用都是**新会话** | 一个 Client 内**共享同一会话** |
+| 轮次 | 单轮 | 多轮（`query()` 可反复调用） |
+| 轮次结束 | 首个 `ResultMessage` 处停止并关闭子进程 | `receive_response()` 收到 `ResultMessage` 就 return，子进程保持 |
+| 适用 | 一次性任务、批处理 | 交互式应用、需要上下文的连续对话 |
+
+Client 的主要方法（源码 `client.py`）：
+
+| 方法 | 说明 |
+|---|---|
+| `connect(prompt=None)` | 建立连接；`async with` 会自动调用 |
+| `query(prompt, session_id="default")` | 发送本轮用户消息 |
+| `receive_response()` | 消费到 `ResultMessage` 自动停；出错抛 `ExecutionError` |
+| `receive_messages()` | **不自动停**，需自己 break；后台任务通知要靠它（案例 10） |
+| `disconnect()` | 断开；`async with` 退出时自动调用 |
+| `interrupt()` / `set_model()` / `set_permission_mode()` / `mcp_server_status()` | 运行期动态控制 |
+
+### 代码
+
+```python
+"""案例 04 · 多轮对话：CodeBuddySDKClient"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterable
+
+from codebuddy_agent_sdk import (
+    AssistantMessage,
+    CodeBuddyAgentOptions,
+    CodeBuddySDKClient,
+    SystemMessage,
+    TextBlock,
+    query,
+)
+from _common.sdk_helpers import brief
+
+MARKER = "ORION-9"
+PROMPT1 = f"请记住这个代号：{MARKER}。只回复「已记住」。"
+PROMPT2 = "我刚才让你记住的代号是什么？只回答代号本身，不要解释。"
+
+
+def make_options() -> CodeBuddyAgentOptions:
+    # 每次新建，避免多个 query 共享同一个 options 对象。
+    # tools=[] 禁用内置工具：否则模型会去 Read/Grep 历史 transcript，
+    # 把「跨文件搜到的信息」误当成「会话上下文」（见下方验证陷阱）。
+    return CodeBuddyAgentOptions(permission_mode="plan", max_turns=10, tools=[])
+
+
+async def collect(stream: AsyncIterable) -> tuple[str, str | None]:
+    """消费一轮消息，返回 (助手文本, init 消息里的 session_id)。"""
+    chunks: list[str] = []
+    session_id: str | None = None
+    async for message in stream:
+        if isinstance(message, SystemMessage) and message.subtype == "init":
+            session_id = message.data.get("session_id")
+        elif isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    chunks.append(block.text)
+    return "".join(chunks).strip(), session_id
+
+
+async def demo_query() -> None:
+    """A：两次独立 query —— 各自新会话，第二轮答不出代号。"""
+    print("=== A：两次独立 query() ===")
+    sids: list[str | None] = []
+    answers: list[str] = []
+    for prompt in (PROMPT1, PROMPT2):
+        text, sid = await collect(query(prompt=prompt, options=make_options()))
+        sids.append(sid)
+        answers.append(text)
+        print(f"  {brief(prompt, 34)} -> {text!r}  session={sid}")
+    print(f"  不同会话数: {len(set(sids))}  → 两次 query 各自开新会话")
+    print(f"  第二轮答出代号 {MARKER}: {MARKER in answers[1]}\n")
+
+
+async def demo_client() -> None:
+    """B：同一个 Client 内两轮 —— 共享会话，第二轮答得出代号。"""
+    print("=== B：CodeBuddySDKClient 两轮 ===")
+    sids: list[str | None] = []
+    answers: list[str] = []
+    # async with 自动调用 connect() / disconnect()
+    async with CodeBuddySDKClient(options=make_options()) as client:
+        for prompt in (PROMPT1, PROMPT2):
+            await client.query(prompt)                          # 发送本轮消息
+            text, sid = await collect(client.receive_response())  # 收到 ResultMessage 自动停
+            sids.append(sid)
+            answers.append(text)
+            print(f"  {brief(prompt, 34)} -> {text!r}  session={sid}")
+        print(f"  [动态控制] 当前权限模式: {client.get_permission_mode()}")
+    same = sids[0] is not None and sids[0] == sids[1]
+    print(f"  不同会话数: {len(set(sids))}  → 两轮共享同一会话: {same}")
+    print(f"  第二轮答出代号 {MARKER}: {MARKER in answers[1]}\n")
+
+
+def explain() -> None:
+    print("=== 要点 ===")
+    print("  · query() 每次都是新会话；多轮必须靠 Client，或靠 resume（案例 5）。")
+    print("  · async with CodeBuddySDKClient(...) 自动 connect() / disconnect()。")
+    print("  · receive_response() 收到 ResultMessage 就 return（出错抛 ExecutionError）；")
+    print("    receive_messages() 不自动停，需自己 break，用于后台任务通知（案例 10）。")
+    print("  · Client 还有 interrupt() / set_model() / set_permission_mode() / mcp_server_status()。")
+    print()
+    print("=== 验证陷阱（实测）===")
+    print(f"  若不加 tools=[]，A 组两次独立 query 的第二轮「也会」答出 {MARKER}。")
+    print("  实测 grep 发现该代号出现在 7 个 transcript 文件里——query() 默认")
+    print("  persist_session=True，对话写入 ~/.codebuddy/projects/<slug>/<session_id>.jsonl，")
+    print("  模型用 Grep/Read 就能读到，于是「答出代号」被误当成「保持了上下文」。")
+    print("  所以本例用 tools=[] 关掉读取能力，并以 session_id 作为确定性判据：")
+    print("  A 组 2 个会话，B 组 1 个会话。")
+
+
+async def main() -> None:
+    await demo_query()
+    await demo_client()
+    explain()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 运行与实测输出
+
+```bash
+uv run python cases/04_multi_turn.py
+```
+
+```
+=== A：两次独立 query() ===
+  请记住这个代号：ORION-9… -> '已记住'                    session=01a1b5fd-…f80
+  我刚才让你记住的代号是什么？… -> '当前对话中没有您让我记住的代号。'  session=01a1b5fe-…020
+  不同会话数: 2  → 两次 query 各自开新会话
+  第二轮答出代号 ORION-9: False
+
+=== B：CodeBuddySDKClient 两轮 ===
+  请记住这个代号：ORION-9… -> '已记住'                    session=01a1b5ff-…d49
+  我刚才让你记住的代号是什么？… -> 'ORION-9'             session=01a1b5ff-…d49
+  [动态控制] 当前权限模式: plan
+  不同会话数: 1  → 两轮共享同一会话: True
+  第二轮答出代号 ORION-9: True
+```
+
+两条判据同时成立：**A 组 2 个 session_id 且答不出代号，B 组 1 个 session_id 且答得出**。
+
+### 验证陷阱（实测）
+
+这是本系列里第二次踩到同一类坑（第一次在案例 02）。最初版本没有加 `tools=[]`，结果 A 组两次独立 `query()` 的第二轮**也答出了 ORION-9**，看似「上下文跨会话保持了」。
+
+静态检查给出了原因：`grep -rl ORION-9 ~/.codebuddy/projects/home-sunqi-src-blenderModel/` 命中 **7 个文件**，其中就包含第一轮那个会话的 transcript。因为 `query()` 默认 `persist_session=True`，每轮对话都落盘；模型拿到完整工具集后会用 `Grep` / `Read` 去翻这些历史文件，于是「搜到的信息」被误当成「记住的信息」。反复运行还会让 transcript 越堆越多、搜索越来越慢（一次复跑直接卡在第二轮超时）。
+
+解法有两点，缺一不可：
+
+- **关掉读取能力**：`tools=[]` 禁用全部内置工具（案例 03 讲过的字段），模型只能依据本轮上下文作答。
+- **用确定性判据**：`session_id` 来自 `SystemMessage(init)`，不依赖模型回答内容。A 组 2 个、B 组 1 个，这才是「会话是否共享」的直接证据。
+
+顺带一提，案例 03 的思考题「把 `tools` 改成 `[]` 会怎样」在这里有了答案：不是让模型干不了活，而是可以主动用它来隔离信息源。
+
+### 思考题
+
+- 把 `tools=[]` 去掉再跑一次，复现 A 组第二轮答出代号的陷阱。
+- 把 `receive_response()` 换成 `receive_messages()`，观察它为什么不会自己停下来。
+- 在 B 组两轮之间调用 `await client.set_model(...)` 或 `await client.interrupt()`，看看动态控制的效果。
+
 ---
 
 ## 环境信息
@@ -517,4 +696,4 @@ uv run python cases/03_readonly_analysis.py
 
 ## 下一步
 
-案例 4：多轮对话——`CodeBuddySDKClient` + `receive_response()`。
+案例 5：会话持久化——`session_id` / `resume` / `continue_conversation`。
