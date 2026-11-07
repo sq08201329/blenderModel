@@ -1,7 +1,7 @@
 # CodeBuddy Agent SDK 调研与教学案例
 
 > 调研日期：2026-11-06
-> 依据：本地内置中文文档 `/usr/local/lib/node_modules/@tencent-ai/codebuddy-code/dist/web-ui/docs/cn%2Fcli%2Fsdk*.md`，并以 `codebuddy-agent-sdk==0.3.299` 实测校验
+> 依据：[CodeBuddy CLI SDK 文档](https://www.codebuddy.cn/docs/cli/sdk)，并以 `uv.lock` 锁定的 `codebuddy-agent-sdk` 0.3.299 实测校验
 > 教学语言：Python（承接本仓库已建好的 UV 项目）；配套代码在 `cases/`
 
 ---
@@ -140,7 +140,7 @@ if __name__ == "__main__":
 
 ```bash
 # 前置：codebuddy 已登录，或 export CODEBUDDY_API_KEY=...
-uv add codebuddy-agent-sdk
+uv sync
 uv run python cases/01_hello_query.py
 ```
 
@@ -357,9 +357,9 @@ init 快照片段（实测）：
 
 | 项 | 值 |
 |---|---|
-| Python | 3.12.3（`.python-version` 固定） |
-| 包管理 | UV，`uv add` / `uv sync` / `uv run` |
-| SDK | `codebuddy-agent-sdk==0.3.299` |
+| Python | 3.12（由 `.python-version` 指定） |
+| 包管理 | UV，`uv sync` / `uv run` |
+| SDK | 项目约束 `>=0.3.299`，`uv.lock` 锁定 0.3.299 |
 | CLI | `/usr/local/bin/codebuddy` |
 
 ## 下一步

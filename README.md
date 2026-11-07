@@ -8,9 +8,9 @@ CodeBuddy Agent SDK 的调研笔记与由浅入深的 Python 教学案例。
 
 | 项 | 值 |
 |---|---|
-| Python | 3.12（`.python-version` 固定） |
+| Python | 3.12（由 `.python-version` 指定） |
 | 包管理 | [UV](https://docs.astral.sh/uv/) |
-| SDK | `codebuddy-agent-sdk>=0.3.299` |
+| SDK | 项目约束 `>=0.3.299`，`uv.lock` 锁定 0.3.299 |
 | 前置 | 已安装 `codebuddy` CLI 并完成登录，或设置 `CODEBUDDY_API_KEY` |
 
 ## 快速开始
@@ -24,6 +24,8 @@ uv run python cases/01_hello_query.py
 
 `query()` 会真实调用模型并产生费用，运行前请确认认证可用。
 
+`uv.lock` 中的依赖地址使用阿里云 PyPI 镜像（`mirrors.aliyun.com`）；无法访问该镜像时，请先配置可用的包索引再执行 `uv sync`。
+
 ## 目录结构
 
 ```
@@ -34,6 +36,8 @@ cases/
     sdk_helpers.py         # 公共函数：format_message / dump_message / dump_stream
 docs/
   codebuddy-agent-sdk-tutorial.md   # 调研 + API 清单 + 课程大纲 + 案例讲解
+.python-version            # Python 版本（3.12）
+.gitignore                 # 忽略 __pycache__/ 与 .venv/
 pyproject.toml / uv.lock   # UV 项目与锁定依赖
 ```
 
@@ -43,7 +47,7 @@ pyproject.toml / uv.lock   # UV 项目与锁定依赖
 ## 课程进度
 
 案例 **01–02** 已完成：消息流分层、`query()` 基础用法、Options 全景、`setting_sources` 环境隔离。
-案例 03–10（让 Agent 干活、多轮对话、会话恢复、权限控制、Hooks、自定义 Agent、自定义工具/MCP、综合实战）待补充，完整大纲见教程文档。
+案例 03–10（让 Agent 干活：工具白名单、只读分析项目；多轮对话、会话恢复、权限控制、Hooks、自定义 Agent、自定义工具/MCP、综合实战）待补充，完整大纲见教程文档。
 
 ## 几个已验证的要点
 
@@ -58,3 +62,7 @@ pyproject.toml / uv.lock   # UV 项目与锁定依赖
 - [CodeBuddy Agent SDK 文档](https://www.codebuddy.cn/docs/cli/sdk)
 - [Python SDK 参考](https://www.codebuddy.cn/docs/cli/sdk-python)
 - [TypeScript SDK 参考](https://www.codebuddy.cn/docs/cli/sdk-typescript)
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
