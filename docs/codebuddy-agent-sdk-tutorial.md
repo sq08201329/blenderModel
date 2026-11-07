@@ -43,7 +43,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 2. Options 全景 & 环境隔离 `setting_sources` ← 案例 02
 3. 让 Agent 干活：工具白名单、`ToolUseBlock`、只读分析项目 ← 案例 03
 4. 多轮对话：`CodeBuddySDKClient` + `receive_response` ← 案例 04
-5. 会话持久化：`session_id` / `resume` / `continue_conversation`
+5. 会话持久化：`session_id` / `resume` / `continue_conversation` ← 案例 05
 6. 权限控制：`can_use_tool` 白名单与危险命令拦截
 7. Hook 系统：`PreToolUse` 审计与阻断
 8. 自定义子 Agent：`AgentDefinition`
@@ -685,6 +685,178 @@ uv run python cases/04_multi_turn.py
 
 ---
 
+## 案例 05 · 会话持久化：session_id / resume / continue_conversation
+
+难度：★★★☆☆
+目标：拿到 `session_id`、确认会话落盘，并用 `resume` 与 `continue_conversation` 把上下文带回来。
+
+可运行文件：[`cases/05_session_persistence.py`](../cases/05_session_persistence.py)。本例发起 4 次真实模型调用。
+
+### 知识点：会话字段与 CLI 参数
+
+SDK 的 `CodeBuddyAgentOptions` 里与会话相关的字段，最终都映射成 CLI 参数（源码 `transport/subprocess.py:259-273`）：
+
+| 字段 | CLI 参数 | 作用 |
+|---|---|---|
+| `resume` | `--resume <sid>` | 恢复指定 ID 的会话 |
+| `continue_conversation` | `--continue` | 加载**当前目录最近**的对话 |
+| `fork_session` | `--fork-session` | 从会话分叉出新分支 |
+| `persist_session=False` | `--no-session-persistence` | 不写 transcript，只留内存 |
+| `session_id` | `--session-id <id>` | 指定会话 ID（有格式校验） |
+
+`session_id` 有两个来源，实测**完全一致**：`SystemMessage(init).data["session_id"]` 和 `ResultMessage.session_id`。会话落盘位置为 `~/.codebuddy/projects/<cwd 的 / 换成 ->/<session_id>.jsonl`（案例 01 之后已确认过）。
+
+### 代码
+
+```python
+"""案例 05 · 会话持久化：session_id / resume / continue_conversation"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+from codebuddy_agent_sdk import (
+    AssistantMessage,
+    CodeBuddyAgentOptions,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    query,
+)
+
+MARKER = "VEGA-42"
+PROMPT_SET = f"请记住这个代号：{MARKER}。只回复「已记住」。"
+PROMPT_ASK = "我刚才让你记住的代号是什么？只回答代号本身，不要解释。"
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+
+
+def transcript_dir(cwd: Path) -> Path:
+    """CLI 把 cwd 的 / 换成 - 作为项目目录名（Linux 路径）。"""
+    slug = str(cwd).replace("/", "-").lstrip("-")
+    return Path.home() / ".codebuddy" / "projects" / slug
+
+
+def make_options(**overrides: Any) -> CodeBuddyAgentOptions:
+    # tools=[] 关掉读取能力：否则模型会去翻历史 transcript，
+    # 把「搜到的信息」误当成「恢复的上下文」（案例 04 的验证陷阱）。
+    base: dict[str, Any] = dict(
+        cwd=str(PROJECT_DIR),
+        permission_mode="plan",
+        max_turns=10,
+        tools=[],
+    )
+    base.update(overrides)
+    return CodeBuddyAgentOptions(**base)
+
+
+async def ask(prompt: str, **overrides: Any) -> tuple[str, str | None, str | None]:
+    """跑一次 query，返回 (助手文本, init.session_id, ResultMessage.session_id)。"""
+    chunks: list[str] = []
+    init_sid: str | None = None
+    result_sid: str | None = None
+    async for message in query(prompt=prompt, options=make_options(**overrides)):
+        if isinstance(message, SystemMessage) and message.subtype == "init":
+            init_sid = message.data.get("session_id")
+        elif isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    chunks.append(block.text)
+        elif isinstance(message, ResultMessage):
+            result_sid = message.session_id
+    return "".join(chunks).strip(), init_sid, result_sid
+
+
+def show(label: str, text: str, sid: str | None, original: str) -> None:
+    print(f"  {label}")
+    print(f"    回答      = {text!r}")
+    print(f"    命中代号  = {MARKER in text}")
+    print(f"    session_id= {sid}  (与原会话相同: {sid == original})")
+
+
+async def main() -> None:
+    print("=== 1. 建立会话，取 session_id ===")
+    _, init_sid, result_sid = await ask(PROMPT_SET)
+    original = result_sid or init_sid or ""
+    print(f"  init.session_id   = {init_sid}")
+    print(f"  result.session_id = {result_sid}")
+    print(f"  两者一致          = {init_sid == result_sid}")
+    path = transcript_dir(PROJECT_DIR) / f"{original}.jsonl"
+    print(f"  transcript 落盘   = {path.exists()}  {path}")
+
+    print("\n=== 2. continue_conversation=True（当前目录最近的会话）===")
+    text, _, sid = await ask(PROMPT_ASK, continue_conversation=True)
+    show("紧跟第 1 步执行，--continue 加载最近会话", text, sid, original)
+
+    print("\n=== 3. 不带任何恢复（对照）===")
+    text, _, sid = await ask(PROMPT_ASK)
+    show("全新会话，无 resume / continue", text, sid, original)
+
+    print("\n=== 4. resume=<sid>（恢复指定会话）===")
+    text, _, sid = await ask(PROMPT_ASK, resume=original)
+    show("显式恢复到第 1 步的会话", text, sid, original)
+
+    print("\n=== 字段与 CLI 参数映射 ===")
+    print("  resume               -> --resume <sid>")
+    print("  continue_conversation-> --continue（加载当前目录最近的对话）")
+    print("  fork_session         -> --fork-session")
+    print("  persist_session=False-> --no-session-persistence")
+    print("  session_id           -> --session-id <id>（有格式校验）")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 运行与实测输出
+
+```bash
+uv run python cases/05_session_persistence.py
+```
+
+```
+=== 1. 建立会话，取 session_id ===
+  init.session_id   = 01a1b663-dd54-771e-8466-56afb75eacb1
+  result.session_id = 01a1b663-dd54-771e-8466-56afb75eacb1
+  两者一致          = True
+  transcript 落盘   = True  ~/.codebuddy/projects/home-sunqi-src-blenderModel/01a1b663-….jsonl
+
+=== 2. continue_conversation=True ===
+    回答      = 'VEGA-42'                 命中代号 = True
+    session_id= 01a1b663-…  (与原会话相同: True)
+
+=== 3. 不带任何恢复（对照）===
+    回答      = '本次对话是你发来的第一条消息…'   命中代号 = False
+    session_id= 01a1b664-…  (与原会话相同: False)
+
+=== 4. resume=<sid> ===
+    回答      = 'VEGA-42'                 命中代号 = True
+    session_id= 01a1b663-…  (与原会话相同: True)
+```
+
+### 三个结论
+
+1. **`session_id` 是会话的身份**：`init` 与 `ResultMessage` 两处取值一致；恢复会话（`resume` / `continue`）时 `ResultMessage.session_id` 保持原值不变，而全新会话会拿到新 ID。这比「模型答没答对」可靠得多。
+2. **两种恢复都带回了上下文**：`--continue` 续接当前目录最近的对话，`--resume` 精确恢复指定 ID。两者第二轮都答出了代号。
+3. **对照组证明不是巧合**：不带任何恢复的调用拿到新 `session_id`，并明确回答「本轮没有记录过代号」。
+
+### 两个必须注意的点
+
+- **仍要 `tools=[]`**。和案例 04 完全一样：不禁用内置工具，模型会用 `Grep` / `Read` 翻到落盘的 transcript，对照组也会「答出代号」，整个实验就失效了。
+- **`continue_conversation` 依赖「当前目录最近的对话」**，是多会话/并行环境下最不确定的一个：如果别的进程在同一 `cwd` 又开了会话，它续接的可能不是你想要的那个。需要精确控制时优先用 `resume=<sid>`；本例第 2 步紧跟第 1 步执行，才保证了「最近」指向刚建的会话。
+
+`fork_session` / `persist_session` / `session_id` 本例只列了映射，没有实跑；`persist_session=False` 可以让会话不落盘，正好能从根本上避开上面那个 transcript 干扰。
+
+### 思考题
+
+- 把第 4 步的 `resume` 换成一个不存在的 ID，观察 SDK 抛什么异常、属于 `CodeBuddySDKError` 的哪一支。
+- 给所有调用加 `persist_session=False`，再去掉 `tools=[]`，看对照组是否还会被 transcript 干扰。
+- 用 `fork_session=True` 配合 `resume=<sid>` 跑一次，对比 `ResultMessage.session_id` 是保持原值还是分叉出新 ID。
+
+---
+
 ## 环境信息
 
 | 项 | 值 |
@@ -696,4 +868,4 @@ uv run python cases/04_multi_turn.py
 
 ## 下一步
 
-案例 5：会话持久化——`session_id` / `resume` / `continue_conversation`。
+案例 6：权限控制——`can_use_tool` 白名单与危险命令拦截。

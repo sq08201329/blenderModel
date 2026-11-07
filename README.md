@@ -34,6 +34,7 @@ cases/
   02_options_and_settings.py  # 案例 02：Options 全景与 setting_sources
   03_readonly_analysis.py     # 案例 03：工具白名单与工具调用轨迹
   04_multi_turn.py            # 案例 04：CodeBuddySDKClient 多轮对话
+  05_session_persistence.py   # 案例 05：会话持久化与 resume
   _common/
     sdk_helpers.py         # 公共函数：format_message / dump_message / dump_stream / brief
 docs/
@@ -48,8 +49,8 @@ pyproject.toml / uv.lock   # UV 项目与锁定依赖
 
 ## 课程进度
 
-案例 **01–04** 已完成：消息流分层、`query()` 基础用法、Options 全景、`setting_sources` 环境隔离、工具白名单与只读分析、多轮对话。
-案例 05–10（会话恢复、权限控制、Hooks、自定义 Agent、自定义工具/MCP、综合实战）待补充，完整大纲见教程文档。
+案例 **01–05** 已完成：消息流分层、`query()` 基础用法、Options 全景、`setting_sources` 环境隔离、工具白名单与只读分析、多轮对话、会话持久化。
+案例 06–10（权限控制、Hooks、自定义 Agent、自定义工具/MCP、综合实战）待补充，完整大纲见教程文档。
 
 ## 几个已验证的要点
 
