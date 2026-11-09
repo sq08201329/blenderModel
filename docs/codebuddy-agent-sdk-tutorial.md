@@ -44,7 +44,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 3. 让 Agent 干活：工具白名单、`ToolUseBlock`、只读分析项目 ← 案例 03
 4. 多轮对话：`CodeBuddySDKClient` + `receive_response` ← 案例 04
 5. 会话持久化：`session_id` / `resume` / `continue_conversation` ← 案例 05
-6. 权限控制：`can_use_tool` 白名单与危险命令拦截
+6. 权限控制：`can_use_tool` 白名单与危险命令拦截 ← 案例 06
 7. Hook 系统：`PreToolUse` 审计与阻断
 8. 自定义子 Agent：`AgentDefinition`
 9. 自定义工具：`@tool` + `create_sdk_mcp_server` / 外部 MCP
@@ -857,6 +857,216 @@ uv run python cases/05_session_persistence.py
 
 ---
 
+## 案例 06 · 权限控制：can_use_tool 白名单与危险命令拦截
+
+难度：★★★★☆
+目标：掌握运行时权限回调，能改写入参、拦截危险命令、中断会话，并避开「没有回调就自动拒绝」的坑。
+
+可运行文件：[`cases/06_permission_control.py`](../cases/06_permission_control.py)。本例发起 3 次真实模型调用；所有 Bash 命令都是无害的 `echo`，危险命令在工具执行前就被拦截，不会真正运行。
+
+### 知识点：回调签名与三种返回
+
+`can_use_tool` 是**异步**回调（源码 `types.py:79-83`）：
+
+```python
+CanUseTool = Callable[
+    [str, dict[str, Any], CanUseToolOptions],   # tool_name, input_data, options
+    Awaitable[PermissionResult],
+]
+```
+
+| 返回 | 效果 |
+|---|---|
+| `PermissionResultAllow(updated_input=...)` | 允许执行；传入的 dict 会**替换**工具入参，可用来改写命令 |
+| `PermissionResultAllow()` | 允许，不改入参（安装版 `updated_input` 默认 `None`） |
+| `PermissionResultDeny(message=..., interrupt=False)` | 拒绝本次调用，会话继续 |
+| `PermissionResultDeny(message=..., interrupt=True)` | 拒绝并**中断整个会话** |
+
+`CanUseToolOptions` 携带 `tool_use_id` / `agent_id` / `suggestions` / `blocked_path` / `decision_reason` 等上下文，可用来做审计或更细的判断。
+
+**权限模式决定回调是否会被触发**（`permission_mode`）：
+
+| 模式 | 行为 |
+|---|---|
+| `default` | 所有工具操作需确认 → **触发 `can_use_tool`** |
+| `acceptEdits` | 自动批准文件编辑，其余仍需确认 |
+| `plan` | 仅允许只读工具 |
+| `bypassPermissions` | 跳过所有权限检查，回调不会被调用 |
+
+本例统一用 `default` + `tools=["Bash"]`，强制每个工具调用都走权限回调。
+
+### 代码
+
+```python
+"""案例 06 · 权限控制：can_use_tool 白名单与危险命令拦截"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from codebuddy_agent_sdk import (
+    AssistantMessage,
+    CanUseToolOptions,
+    CodeBuddyAgentOptions,
+    CodeBuddySDKError,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+    TextBlock,
+    query,
+)
+from _common.sdk_helpers import brief
+
+READ_ONLY = {"Read", "Glob", "Grep"}
+DANGEROUS = ("rm -rf", "sudo", "chmod 777")
+MARKER = "APPROVED_BY_CALLBACK"
+
+
+def log(decision: str, tool: str, detail: str = "") -> None:
+    print(f"    [权限] {decision:<4} {tool:<8} {brief(detail, 90)}")
+
+
+async def allow_and_rewrite(
+    tool_name: str,
+    input_data: dict[str, Any],
+    options: CanUseToolOptions,
+):
+    """场景 A：只读工具放行；Bash 放行但改写入参；其余拒绝。"""
+    if tool_name in READ_ONLY:
+        log("允许", tool_name, "只读工具")
+        return PermissionResultAllow(updated_input=input_data)
+
+    if tool_name == "Bash":
+        command = input_data.get("command", "")
+        log("改写", tool_name, f"{command}  ->  echo {MARKER}")
+        return PermissionResultAllow(
+            updated_input={**input_data, "command": f"echo {MARKER}"}
+        )
+
+    log("拒绝", tool_name, "不在白名单")
+    return PermissionResultDeny(message=f"{tool_name} 不在允许列表")
+
+
+async def block_dangerous(
+    tool_name: str,
+    input_data: dict[str, Any],
+    options: CanUseToolOptions,
+):
+    """场景 B：命中危险关键词就拒绝并中断整个会话。"""
+    command = input_data.get("command", "") if tool_name == "Bash" else ""
+    if any(word in command for word in DANGEROUS):
+        log("拦截", tool_name, command)
+        return PermissionResultDeny(
+            message=f"危险命令被拦截：{command}",
+            interrupt=True,
+        )
+    log("允许", tool_name, command or str(input_data))
+    return PermissionResultAllow(updated_input=input_data)
+
+
+async def run(label: str, prompt: str, callback: Any) -> None:
+    print(f"\n=== {label} ===")
+    options = CodeBuddyAgentOptions(
+        permission_mode="default",   # 需要确认 → 才会触发 can_use_tool
+        max_turns=5,
+        tools=["Bash"],              # 只暴露 Bash，强制走权限回调
+        can_use_tool=callback,
+    )
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        print(f"    [回答] {brief(block.text.strip(), 170)}")
+            elif isinstance(message, ResultMessage):
+                print(f"    [结果] subtype={message.subtype} "
+                      f"is_error={message.is_error} errors={message.errors}")
+    except CodeBuddySDKError as exc:
+        print(f"    [异常] {type(exc).__name__}: {exc}")
+
+
+def explain() -> None:
+    print("\n=== 要点 ===")
+    print("  · 回调签名: async (tool_name, input_data, CanUseToolOptions) -> PermissionResult")
+    print("  · PermissionResultAllow(updated_input=...) 可改写入参；省略则不改。")
+    print("  · PermissionResultDeny(message=..., interrupt=True) 会中断整个会话；")
+    print("    实测表现为 query() 直接抛 ExecutionError（'Permission denied for tool(s): Bash'），")
+    print("    而不是返回一条 ResultMessage，调用方必须 try/except。")
+    print("  · permission_mode='default' 才会触发回调；'bypassPermissions' 直接跳过检查，")
+    print("    'plan' 只允许只读，'acceptEdits' 自动批准文件编辑。")
+    print("  · 坑：不提供 can_use_tool 时，SDK 对权限请求一律回 allowed=False")
+    print("    （_internal/query.py:434-441），工具不会执行；SDK 因此默认注入")
+    print("    CODEBUDDY_DISABLE_AUTO_MEMORY=1，避免 auto-memory 触发 Write 被拒。")
+    print("  · 三层分工：tools 限定工具集 → allowed_tools/disallowed_tools 静态过滤")
+    print("    → can_use_tool 运行时动态审批。")
+
+
+async def main() -> None:
+    await run(
+        "A：白名单 + 改写入参",
+        "请调用 Bash 工具执行命令 echo ORIGINAL，然后把输出告诉我。必须使用工具，不要只回答文字。",
+        allow_and_rewrite,
+    )
+    await run(
+        "B：危险命令拦截并中断",
+        '请调用 Bash 工具执行命令 echo "rm -rf /tmp/case06_nonexistent"，然后把输出告诉我。必须使用工具。',
+        block_dangerous,
+    )
+    await run(
+        "C：不提供回调（对照）",
+        "请调用 Bash 工具执行命令 echo HELLO，然后把输出告诉我。必须使用工具，不要只回答文字。",
+        None,
+    )
+    explain()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 运行与实测输出
+
+```bash
+uv run python cases/06_permission_control.py
+```
+
+```
+=== A：白名单 + 改写入参 ===
+    [权限] 改写   Bash     echo ORIGINAL  ->  echo APPROVED_BY_CALLBACK
+    [回答] 我执行了命令，但返回的输出与预期不符，我再验证一次。
+    [权限] 改写   Bash     echo ORIGINAL  ->  echo APPROVED_BY_CALLBACK
+    [回答] 已按你的要求用 Bash 工具执行了 `echo APPROVED_BY_CALLBACK`（两次验证）…
+    [结果] subtype=success is_error=False errors=None
+
+=== B：危险命令拦截并中断 ===
+    [权限] 拦截   Bash     echo "rm -rf /tmp/case06_nonexistent"
+    [异常] ExecutionError: Permission denied for tool(s): Bash
+
+=== C：不提供回调（对照） ===
+    [回答] 我已按要求调用了 Bash 工具…都返回同一个错误：No permission handler provided…
+    [结果] subtype=success is_error=False errors=None
+```
+
+### 四个实测结论
+
+1. **`updated_input` 真的会替换工具入参**：A 场景两次调用都被从 `echo ORIGINAL` 改成 `echo APPROVED_BY_CALLBACK`，模型甚至察觉到输出不符、主动重试了一次并指出「有 hook/回调在改写命令」。这是做命令审计、注入 `set -e` 之类安全前缀的抓手。
+2. **`interrupt=True` 不是返回一条消息，而是抛异常**：B 场景 `query()` 直接抛 `ExecutionError: Permission denied for tool(s): Bash`，循环里必须 `try/except CodeBuddySDKError`，否则程序会崩。
+3. **不提供回调 = 全部拒绝**：C 场景模型反复尝试都拿到 `No permission handler provided`，工具一次也没执行，但 `ResultMessage` 仍是 `subtype=success`——**不能只看 result 判断工具是否成功**。源码 `_internal/query.py:434-441` 在没有 `can_use_tool` 时直接回 `allowed=False`。SDK 也因此默认注入 `CODEBUDDY_DISABLE_AUTO_MEMORY=1`，避免 auto-memory 触发 `Write` 被拒、破坏会话状态。
+4. **三层权限控制的分工**：`tools` 限定「模型能看到哪些工具」→ `allowed_tools` / `disallowed_tools` 做静态过滤 → `can_use_tool` 做运行时动态审批（能改写、能中断、能接人工确认）。生产环境别用 `bypassPermissions`。
+
+### 安全说明
+
+本例故意用 `echo` 承载危险关键词（如 `echo "rm -rf /tmp/case06_nonexistent"`）：既能触发拦截规则，又保证即使回调失效也不会执行任何破坏性命令。`can_use_tool` 在工具**执行前**触发，所以被拒绝的命令根本不会运行。
+
+### 思考题
+
+- 把 B 场景的 `interrupt=True` 改成 `False`，对比 `ResultMessage` 和模型回答的变化。
+- 把 `permission_mode` 改成 `bypassPermissions`，观察回调是否还被触发。
+- 在回调里打印 `options.suggestions` / `options.decision_reason`，看看 CLI 给了哪些权限建议。
+
+---
+
 ## 环境信息
 
 | 项 | 值 |
@@ -868,4 +1078,4 @@ uv run python cases/05_session_persistence.py
 
 ## 下一步
 
-案例 6：权限控制——`can_use_tool` 白名单与危险命令拦截。
+案例 7：Hook 系统——`PreToolUse` 审计与阻断。
