@@ -47,7 +47,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 6. 权限控制：`can_use_tool` 白名单与危险命令拦截 ← 案例 06
 7. Hook 系统：`PreToolUse` 审计与阻断 ← 案例 07
 8. 自定义子 Agent：`AgentDefinition` ← 案例 08
-9. 自定义工具：`@tool` + `create_sdk_mcp_server` / 外部 MCP
+9. 自定义工具：`@tool` + `create_sdk_mcp_server` / 外部 MCP ← 案例 09
 10. 综合实战：批量代码审查 CLI（流式输入、中断、错误处理、成本统计）
 
 ---
@@ -1435,6 +1435,182 @@ uv run python cases/08_subagents.py
 
 ---
 
+## 案例 09 · 自定义工具：@tool + create_sdk_mcp_server
+
+难度：★★★★☆
+目标：认识 `@tool` / `create_sdk_mcp_server` / `mcp_servers` 三个 API 与 `CallToolResult` 返回格式、定义进程内自定义工具并让模型调用、用 `input_schema` 的两种写法定义参数、用「不注册 `mcp_servers`」作对照。
+
+可运行文件：[`cases/09_custom_tools.py`](../cases/09_custom_tools.py)。本例发起 3 次真实模型调用；自定义工具只做加法和只读行数统计，不启动任何外部进程。
+
+### 知识点：进程内 MCP 与外部 MCP
+
+三个 API（`codebuddy_agent_sdk` 顶层导出）：
+
+| API | 签名 | 作用 |
+|---|---|---|
+| `@tool` | `tool(name, description, input_schema)` | 装饰 `async def f(args: dict)`，给函数挂上 `_tool_definition` |
+| `create_sdk_mcp_server` | `(name, version="1.0.0", tools=None)` | 返回 `McpSdkServerConfig`，即 `{"type": "sdk", "name", "server": SdkMcpServer}` |
+| `mcp_servers` | `dict[str, McpServerConfig]` 或 `str` 或 `Path`（`types.py:609`） | 注册到 `options`；传字符串/路径时表示外部 `--mcp-config` 文件 |
+
+`input_schema` 两种写法（`@tool` 内部由 `_convert_schema` 统一成 JSON Schema）：
+
+| 写法 | 例子 | 效果 |
+|---|---|---|
+| 简单类型映射 | `{"a": int, "b": int}` | 自动转 `{"type":"object","properties":{"a":{"type":"integer"},...}}`，**所有参数自动 required** |
+| JSON Schema | `{"properties": {"filename": {"type":"string","description":"..."}}, "required":["filename"]}` | 可加 `description` / `enum` / `default` 等 |
+
+工具函数必须返回 `CallToolResult`，**不是裸字符串**：
+
+```python
+{"content": [{"type": "text", "text": "42"}], "isError": False}
+```
+
+注意是驼峰 **`isError`**，不是消息流 `ToolResultBlock` 的 `is_error`。
+
+**链路**：
+
+```
+@tool(...) 装饰 async 函数
+  → create_sdk_mcp_server(name, tools=[...])
+      得到 {"type":"sdk","name":...,"server": SdkMcpServer 对象}
+  → options.mcp_servers = {"case-tools": config}
+  → transport 把 type=="sdk" 的项从 --mcp-config 里剥离（subprocess.py:113-145）
+  → initialize 控制请求带上 sdkMcpServers: ["case-tools"]
+  → CLI 用 mcp_message 控制请求回调本地 server.handle_message（:173-204）
+  → 我们的 async 函数在本进程里执行
+```
+
+`McpSdkServerConfig` 里含一个 Python 对象，**无法 JSON 序列化**，所以它不可能走 `--mcp-config`。这是与案例 07 `hooks`、案例 08 `agents` 一脉相承的第三种「走控制协议」的配置，同样不受 `setting_sources` 影响。
+
+| 维度 | 进程内 SDK MCP（本例） | 外部 MCP |
+|---|---|---|
+| 配置 | `create_sdk_mcp_server(...)` 的返回值 | `{"type":"stdio","command":...}` / `http` / `sse` / `remote` |
+| 子进程 | 不起 | 需要 `command` + `args` 起服务 |
+| 通道 | `initialize` 的 `sdkMcpServers` + `mcp_message` 控制请求 | `--mcp-config` JSON |
+| 额外依赖 | 无 | 需要可用的 MCP server 程序 |
+| 配置文件 | 不需要 | 传 `str` / `Path` 指向配置文件 |
+
+**工具全名**是 `mcp__<server>__<tool>`。实测有个容易踩的细节：server 名 `case-tools` 里的连字符会变成下划线，注册出来的是 **`mcp__case_tools__add`**。`allowed_tools` / `can_use_tool` 里必须用这个全名，写短名 `add` 匹配不上。
+
+**坑速查**：
+
+| 坑 | 表现 | 正确做法 |
+|---|---|---|
+| 工具函数返回裸字符串 | CLI 收到非法 `CallToolResult` | `{"content":[{"type":"text","text":...}]}` |
+| 把 `isError` 写成 `is_error` | 错误分支不生效 | 驼峰 `isError` |
+| `allowed_tools` 用短名 | 匹配不上，权限仍被问 | 用全名 `mcp__case_tools__add` |
+| 忘了 `can_use_tool` | MCP 工具被 SDK 一律拒绝 | 提供放行型回调（案例 06） |
+| 多个 query 复用同一个 server 实例 | transport 被覆盖 | 每次 `build_server()` 新建（案例 04） |
+| 以为要写 MCP 配置文件 | 白费功夫 | 程序化 `mcp_servers` 直接生效 |
+
+### 代码
+
+完整可运行代码见 [`cases/09_custom_tools.py`](../cases/09_custom_tools.py)。这里只放最核心的几行示意（省略了本地打点、消息流收集与 `verify()`）：
+
+```python
+@tool("add", "把两个整数相加，返回它们的和。", {"a": int, "b": int})
+async def add(args: dict) -> dict:
+    return {"content": [{"type": "text", "text": str(int(args["a"]) + int(args["b"]))}]}
+
+server = create_sdk_mcp_server(name="case-tools", tools=[add])
+options = make_options(mcp_servers={"case-tools": server})
+```
+
+第二个工具 `count_case_lines` 用 JSON Schema 写法、并做了防目录穿越；两个工具都在函数内部往 `TOOL_HITS` 打点，这是本例的确定性判据。三个场景与 `explain()` 要点都在代码文件里。
+
+### 运行与实测输出
+
+```bash
+uv run python cases/09_custom_tools.py
+```
+
+```
+=== 工具类型自省（不消耗模型调用）===
+  tool(name: 'str', description: 'str', input_schema: 'dict[str, Any]') -> 'Callable[[F], F]'
+  create_sdk_mcp_server(name: 'str', version: 'str' = '1.0.0', tools: 'list[Callable[..., Any]] | None' = None) -> 'McpSdkServerConfig'
+  mcp_servers: dict[str, McpServerConfig] | str | Path（types.py:609）
+  CallToolResult 键 = content, isError（注意是 isError，不是 is_error）
+  McpSdkServerConfig 键 = type, name, server, description, defer_loading
+  · @tool 的 input_schema 支持简单类型映射与 JSON Schema 两种写法。
+  · 返回必须是 {"content": [{"type":"text","text": ...}]}，不是裸字符串。
+  · create_sdk_mcp_server 返回的 dict 里含 SdkMcpServer 对象，不能 JSON 序列化；
+    SDK 把它从 --mcp-config 剥离，改走 initialize 的 sdkMcpServers。
+  已注册 SDK MCP server = case-tools  tools=['add', 'count_case_lines']
+
+=== A：用 add 工具计算 17 + 25 ===
+    [init] mcp_servers=[{'name': 'case-tools', 'status': 'connected'}]
+    [流] 工具调用 mcp__case_tools__add {'a': 17, 'b': 25}
+    [权限] 放行 mcp__case_tools__add
+    [init] mcp_servers=[{'name': 'case-tools', 'status': 'connected'}]
+    [流] 工具结果 [{'type': 'text', 'text': '[{"type":"text","text":"42"}]'}] is_error=False
+    [回答] 使用 add 工具计算结果：**17 + 25 = 42**
+    [结果] subtype=success session_id=01a1c41a-3812-7567-9f87-4b10e9b2fda2 is_error=False errors=None
+    [判据] 本地工具被调用=1 ToolUseBlock=1
+    [判据] (a) add(17, 25) 在本地执行并返回 42：通过 ✓  hits=[{'tool': 'add', 'args': {'a': 17, 'b': 25}, 'result': 42}]
+    [判据] 本轮工具名=['mcp__case_tools__add']
+
+=== B：用 count_case_lines 工具统计行数 ===
+    [init] mcp_servers=[{'name': 'case-tools', 'status': 'connected'}]
+    [流] 工具调用 mcp__case_tools__count_case_lines {'filename': '05_session_persistence.py'}
+    [权限] 放行 mcp__case_tools__count_case_lines
+    [init] mcp_servers=[{'name': 'case-tools', 'status': 'connected'}]
+    [流] 工具结果 [{'type': 'text', 'text': '[{"type":"text","text":"05_session_persistence.py: 119 行"}]'}] is_error=False
+    [回答] 使用 `count_case_lines` 工具统计结果：`05_session_persistence.py` 共 **119 行**。
+    [结果] subtype=success session_id=01a1c41a-5cf0-78bd-840a-94768afceef7 is_error=False errors=None
+    [判据] 本地工具被调用=1 ToolUseBlock=1
+    [判据] (b) count_case_lines 在本地执行：通过 ✓  hits=[{'tool': 'count_case_lines', 'args': {'filename': '05_session_persistence.py'}, 'result': 119}]
+    [判据] 本轮工具名=['mcp__case_tools__count_case_lines']
+
+=== C：不注册 mcp_servers（对照） ===
+    [init] mcp_servers=[]
+    [回答] 42
+    [结果] subtype=success session_id=01a1c41a-90eb-772e-a3d1-4182e236342f is_error=False errors=None
+    [判据] 本地工具被调用=0 ToolUseBlock=0
+    [判据] (c) 未注册时自定义工具从未被调用：通过 ✓  hits=0
+
+=== 要点 ===
+  · @tool(name, description, input_schema) 装饰 async def f(args: dict)。
+    input_schema 两种写法：{a: int} 简单映射，或 {"properties":..., "required":...}。
+  · create_sdk_mcp_server(name, version, tools) 返回 McpSdkServerConfig；
+    把它放进 options.mcp_servers = {server_name: config}。
+  · CallToolResult = {"content": [{"type":"text","text": ...}], "isError": bool}；
+    注意是驼峰 isError，不是 ToolResultBlock 的 is_error。
+  · 进程内 SDK MCP vs 外部 MCP：外部要 stdio/http/sse/remote 配置和子进程；
+    SDK 内嵌不需要起进程，走 initialize 的 sdkMcpServers + mcp_message 控制请求
+    （transport/subprocess.py:113-204），所以也没法用 --mcp-config 传。
+  · 工具全名是 mcp__<server>__<tool>；allowed_tools / can_use_tool 用全名。
+  · 坑：不提供 can_use_tool 时 SDK 一律回 allowed=False（案例 06），
+    MCP 工具也逃不掉，所以本例挂了放行型 allow_all。
+  · 对照案例 07/08：hooks / agents / SDK MCP 都走控制协议，
+    setting_sources=None 关不掉它们。
+```
+
+### 五个实测结论
+
+1. **`init.data["mcp_servers"]` 会报告 SDK server 的连接状态**：注册时是 `[{'name': 'case-tools', 'status': 'connected'}]`，对照场景 C 是 `[]`。这点和案例 08 的 `agents` 不同（那里 `init` 里根本没有 `agents` 字段），是判断 MCP 注册是否生效的现成凭据。
+2. **工具全名是 `mcp__case_tools__add`，连字符会变下划线**：server 名 `case-tools` 在工具名里成了 `case_tools`，格式为 `mcp__<server>__<tool>`。实测 `[权限] 放行 mcp__case_tools__add` 说明权限回调拿到的也是这个全名；`allowed_tools` 里必须写全名，写 `add` 匹配不上。
+3. **判据来自工具函数内部的本地打点**：`TOOL_HITS` 记下 `add(17,25)=42` 与 `count_case_lines("05_session_persistence.py")=119`，比消息流或模型回答都确定。三个场景全通过：A/B 各 1 次本地调用，C 为 0 次且模型自己算出 42。
+4. **工具结果被包了一层字符串**：函数返回 `{"content":[{"type":"text","text":"42"}]}`，但 `ToolResultBlock.content` 是 `[{'type':'text','text':'[{"type":"text","text":"42"}]'}]`——`CallToolResult.content` 被序列化成 JSON 字符串再包一层 text。模型仍能正确读出 42，但自己解析结果块时别假设里面是结构化对象。
+5. **`can_use_tool` 对 MCP 工具同样生效**：案例 06 的坑在这里照样成立，不提供回调 SDK 会一律回 `allowed=False`；本例的放行型 `allow_all` 接住了两次调用。`init.mcp_servers` 在每个场景出现两条，是 MCP 握手后再次发出的 init 快照。
+
+### 验证陷阱
+
+- **不要靠模型有没有答对当判据**（案例 04/05 的教训），也不要只依赖消息流；本例在工具函数内部打点 `TOOL_HITS`，函数被本地执行了就是被本地执行了。
+- **`CallToolResult` 的键是驼峰 `isError`**，`content` 必须是列表；返回裸字符串不行。
+- **`input_schema` 简单类型映射时所有参数自动 required**，想给参数加 `description` 得用 JSON Schema 写法。
+- **工具全名含下划线转换**，且每次 `query()` 要新建 server 实例（案例 04 的「不要共享对象」同样适用）。
+- **对照场景不是严格同 prompt**：C 为了不把工具名喂给模型，改成了「请计算 17 + 25 等于多少」；它证明的是「未注册时自定义工具不会被调用」，不是同 prompt 下的行为差异。
+
+### 思考题
+
+- 用 `allowed_tools=["mcp__case_tools__add"]` 精确放行，再去掉 `can_use_tool`，看是否还需要权限回调。
+- 把 `isError` 写成 `is_error`，观察错误分支是否还生效。
+- 用 `{"type":"stdio","command":...,"args":...}` 配一个外部 MCP server，对比 `init.mcp_servers` 与工具全名。
+- 手动给 `create_sdk_mcp_server` 返回的 dict 补 `defer_loading`，观察工具发现方式的变化。
+- 返回 `ImageContent` 或 `EmbeddedResource`，观察 `ToolResultBlock` 的形态（对应结论 4 的包装行为）。
+
+---
+
 ## 环境信息
 
 | 项 | 值 |
@@ -1446,4 +1622,4 @@ uv run python cases/08_subagents.py
 
 ## 下一步
 
-案例 9：自定义工具——`@tool` + `create_sdk_mcp_server` / 外部 MCP。
+案例 10：综合实战——批量代码审查 CLI（流式输入、中断、错误处理、成本统计）。
