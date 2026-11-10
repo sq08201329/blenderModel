@@ -46,7 +46,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 5. 会话持久化：`session_id` / `resume` / `continue_conversation` ← 案例 05
 6. 权限控制：`can_use_tool` 白名单与危险命令拦截 ← 案例 06
 7. Hook 系统：`PreToolUse` 审计与阻断 ← 案例 07
-8. 自定义子 Agent：`AgentDefinition`
+8. 自定义子 Agent：`AgentDefinition` ← 案例 08
 9. 自定义工具：`@tool` + `create_sdk_mcp_server` / 外部 MCP
 10. 综合实战：批量代码审查 CLI（流式输入、中断、错误处理、成本统计）
 
@@ -1250,6 +1250,191 @@ uv run python cases/07_hooks.py
 
 ---
 
+## 案例 08 · 自定义子 Agent：AgentDefinition
+
+难度：★★★★☆
+目标：认识 `AgentDefinition` 五个字段与 `agents` 的注册方式、定义多个专用子代理并让主 Agent 显式委派、用 `tools` 白名单划分能力边界、用「不注册 `agents`」作对照。
+
+可运行文件：[`cases/08_subagents.py`](../cases/08_subagents.py)。本例发起 3 次真实模型调用。
+
+### 知识点：AgentDefinition 与委派链路
+
+`CodeBuddyAgentOptions.agents` 的类型是 `dict[str, AgentDefinition] | None`（`types.py:642`），**key 就是子代理名**。`AgentDefinition`（`types.py:109-118`）是 dataclass，五个字段：
+
+| 字段 | 类型 | 作用 |
+|---|---|---|
+| `description` | `str` | 子代理用途的自然语言描述；写 `MUST BE USED` / `use PROACTIVELY` 能提高被主动选用的概率 |
+| `prompt` | `str` | 子代理的系统提示词 |
+| `tools` | `list[str]`，可省略 | **省略 → 继承主线程全部工具**；显式列出才成为白名单 |
+| `disallowed_tools` | `list[str]`，可省略 | 黑名单；线上 key 是 `disallowedTools`（`_protocol.py:34-36`） |
+| `model` | `str`，可省略 | 省略 / `inherit` / `default` 都不强制具体模型，走正常解析链 |
+
+**注册与链路**：
+
+```
+options.agents = {"case-reader": AgentDefinition(...), ...}
+  → build_agents_config() 用 asdict 序列化、丢掉 None 字段（_protocol.py:41-58）
+  → 放进 initialize 控制请求的 agents 字段（_internal/query.py:107）
+  → CLI 注册为候选子代理
+  → 主 Agent 调用 Agent 工具，subagent_type 填 key
+  → Spawned successfully（后台任务，返回 agent_id）
+  → 子代理在自己的上下文里用 tools 白名单干活
+  → 结果经 TaskOutput / 后台通知回传
+```
+
+和案例 07 的 `hooks` 一样，`agents` **不是 CLI 参数**：`transport/subprocess.py` 不序列化它，它走进程内控制协议。所以 `setting_sources=None` 关不掉程序化子代理——这正是与案例 02 的对照点：文件型子代理放在 `.codebuddy/agents/` 下，要靠 `setting_sources` 显式加载；`options.agents` 始终生效。
+
+委派靠主 Agent 发起 `Agent` 工具调用，入参形如 `{"description", "prompt", "subagent_type": "case-reader", "name": "case-reader"}`（本例实测）。可以在 prompt 里点名子代理做**显式调用**，也可以靠 `description` 让模型自动选用。
+
+**坑速查**：
+
+| 坑 | 表现 | 正确做法 |
+|---|---|---|
+| 想从 `SystemMessage(init).data` 里找 `agents` | 实测 `init.data` 根本没有这个字段 | 用 `ToolUseBlock(name="Agent")` 的 `subagent_type` 判断 |
+| 以为 `ResultMessage` 到了子代理就完成 | 主流程可能在子代理还在 `running` 时就结束 | 用 `TaskOutput` 轮询 / 后台任务通知 |
+| 以为 `tools` 默认是白名单 | 省略时继承主线程全部工具 | 显式列出才限制 |
+| 忘了 `can_use_tool` | 子代理的工具请求也被 SDK 一律拒绝 | 提供放行型回调（案例 06 的坑） |
+| 以为 `setting_sources` 能关掉程序化 `agents` | 照常生效 | 不注册 `agents` 才关闭 |
+
+### 代码
+
+完整可运行代码见 [`cases/08_subagents.py`](../cases/08_subagents.py)。这里只放注册部分的最小示意（省略了消息流收集、权限回调与 `verify()`）：
+
+```python
+agents = {
+    "case-reader": AgentDefinition(
+        description="只读分析助手。MUST BE USED when asked to inspect case files.",
+        prompt="你是只读分析助手，只读取文件并给出简短结论。",
+        tools=["Read", "Glob", "Grep"],   # 省略则继承主线程全部工具
+    ),
+    "case-counter": AgentDefinition(
+        description="计数助手。MUST BE USED when asked to count lines.",
+        prompt="你是计数助手，用 wc -l 统计行数，只回报数字。",
+        tools=["Bash"],
+    ),
+}
+options = make_options(agents=agents)
+```
+
+主 Agent 侧的委派由模型发起（不是我们手写）：调用 `Agent` 工具并填 `subagent_type="case-reader"`。判据、对照场景与 `explain()` 要点都在代码文件里，配合下面的实测输出阅读。
+
+### 运行与实测输出
+
+```bash
+uv run python cases/08_subagents.py
+```
+
+```
+=== Agent 类型自省（不消耗模型调用）===
+  AgentDefinition 字段 = description, prompt, tools, disallowed_tools, model
+  agents: dict[str, AgentDefinition] | None（types.py:642）
+  · key 是子代理名；主 Agent 通过 Agent 工具的 subagent_type 指定。
+  · tools 省略 → 继承主线程全部工具；指定则成为白名单。
+  · disallowed_tools 在线上叫 disallowedTools（_protocol.py:34-36）。
+  · agents 与 hooks 一样走 initialize 控制协议，setting_sources 不影响。
+  已注册子代理 = ['case-counter', 'case-reader']
+
+=== A：注册并显式委派 case-reader ===
+    [init] keys=['__timestamp', 'apiKeySource', 'cwd', 'mcp_servers', 'model', 'output_style', 'permissionMode', 'session_id', 'slash_commands', 'subtype', 'tools', 'type', 'uuid']
+    [流] 工具调用 Agent {'description': '读取案例并说明难度星级', 'prompt': '请读取 cases/01_hello_query.py 文件，并说明它的难度星级（难度几颗星）。请给出你的判断依据。', 'subagent_type': 'case-reader', 'name': 'case-reader'}
+    [流] 工具结果 [{'type': 'text', 'text': 'Spawned successfully.\nagent_id: case-reader@_auto_01a1c3ef-6fbd-787e-a884-d2198979ba26\nname…(共 313 字符) is_error=False
+    [init] keys=['__timestamp', 'apiKeySource', 'cwd', 'mcp_servers', 'model', 'output_style', 'permissionMode', 'session_id', 'slash_commands', 'subtype', 'tools', 'type', 'uuid']
+    [回答] 已委派给 `case-reader` 子代理。等待它的结果。
+    [流] 工具调用 TaskOutput {'task_id': 'agent-bf4a47d7-b915-438b-a774-fd9216455942', 'block': True}
+    [流] 工具结果 [{'type': 'text', 'text': 'Task ID: agent-bf4a47d7-b915-438b-a774-fd9216455942\nStatus: running\n\nThis is a team member…(共 253 字符) is_error=False
+    [流] 工具调用 Glob {'pattern': '**/cases/01_hello_query.py'}
+    [流] 工具结果 [{'type': 'text', 'text': '["/Users/sunqi/projects/blenderModel/cases/01_hello_query.py"]'}] is_error=False
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/01_hello_query.py'}
+    [流] 工具调用 Glob {'pattern': '**/cases/*.py'}
+    [流] 工具结果 [{'type': 'text', 'text': '   1→"""\n   2→案例 01 · Hello, query()\n   3→\n   4→难度：★☆☆☆☆\n   5→目标：跑通一次最简单的 SDK 查询，看懂消息流里到底…(共 3074 字符) is_error=False
+    [流] 工具结果 [{'type': 'text', 'text': '["/Users/sunqi/projects/blenderModel/cases/01_hello_query.py","/Users/sunqi/projects/blenderM…(共 540 字符) is_error=False
+    [回答] 子代理 `case-reader` 正在后台读取文件并分析，完成后会把结果通过消息返回。我会在收到结果后向你汇报难度星级及判断依据。
+    [结果] subtype=success session_id=01a1c3ef-6fbd-787e-a884-d2198979ba26 is_error=False errors=None
+    [判据] ToolUseBlock=5 其中 Agent 工具=1
+    [判据] (a) 委派到 case-reader：通过 ✓  命中=1
+
+=== B：委派 case-counter（tools 白名单只给 Bash） ===
+    [init] keys=['__timestamp', 'apiKeySource', 'cwd', 'mcp_servers', 'model', 'output_style', 'permissionMode', 'session_id', 'slash_commands', 'subtype', 'tools', 'type', 'uuid']
+    [流] 工具调用 Agent {'description': '统计文件行数', 'prompt': '请使用 Bash 工具执行命令 `wc -l cases/07_hooks.py`，统计该文件的行数，并把命令输出的行数结果报告给我。只执行这一条命令即可。', 'subagent_type': 'case-counter', 'name': '…(共 174 字符)
+    [流] 工具结果 [{'type': 'text', 'text': 'Spawned successfully.\nagent_id: case-counter@_auto_01a1c3ef-a39c-7e7c-93d3-d094d3aee9b6\nnam…(共 315 字符) is_error=False
+    [init] keys=['__timestamp', 'apiKeySource', 'cwd', 'mcp_servers', 'model', 'output_style', 'permissionMode', 'session_id', 'slash_commands', 'subtype', 'tools', 'type', 'uuid']
+    [回答] 已委派给 `case-counter` 子代理，等待其返回统计结果。
+    [流] 工具调用 TaskOutput {'task_id': 'agent-e0c1cf22-2481-456b-93e8-ccf77aa22a9f', 'block': True}
+    [流] 工具结果 [{'type': 'text', 'text': 'Task ID: agent-e0c1cf22-2481-456b-93e8-ccf77aa22a9f\nStatus: running\n\nThis is a team member…(共 253 字符) is_error=False
+    [流] 工具调用 Bash {'command': 'wc -l cases/07_hooks.py', 'description': 'Count lines in cases/07_hooks.py'}
+    [权限] 放行 Bash
+    [init] keys=['__timestamp', 'apiKeySource', 'cwd', 'mcp_servers', 'model', 'output_style', 'permissionMode', 'session_id', 'slash_commands', 'subtype', 'tools', 'type', 'uuid']
+    [流] 工具结果 [{'type': 'text', 'text': 'Stdout:      299 cases/07_hooks.py\n\nStderr: (empty)\nExit Code: 0\nSignal: (none)'}] is_error=False
+    [回答] 子代理 `case-counter` 已在后台运行，正在执行 `wc -l cases/07_hooks.py`。我会在它完成后收到通知并汇报结果（按要求，我没有自己执行该命令）。
+    [结果] subtype=success session_id=01a1c3ef-a39c-7e7c-93d3-d094d3aee9b6 is_error=False errors=None
+    [判据] ToolUseBlock=3 其中 Agent 工具=1
+    [判据] (b) 委派到 case-counter：通过 ✓  命中=1
+
+=== C：不注册 agents（对照） ===
+    [init] keys=['__timestamp', 'apiKeySource', 'cwd', 'mcp_servers', 'model', 'output_style', 'permissionMode', 'session_id', 'slash_commands', 'subtype', 'tools', 'type', 'uuid']
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/01_hello_query.py'}
+    [流] 工具调用 Glob {'pattern': 'cases/**'}
+    [流] 工具结果 [{'type': 'text', 'text': '   1→"""\n   2→案例 01 · Hello, query()\n   3→\n   4→难度：★☆☆☆☆\n   5→目标：跑通一次最简单的 SDK 查询，看懂消息流里到底…(共 3074 字符) is_error=False
+    [流] 工具结果 [{'type': 'text', 'text': '["/Users/sunqi/projects/blenderModel/cases/01_hello_query.py","/Users/sunqi/projects/blenderM…(共 606 字符) is_error=False
+    [流] 工具调用 Glob {'pattern': '**/*.md'}
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/_common/sdk_helpers.py'}
+    [流] 工具结果 [{'type': 'text', 'text': '["/Users/sunqi/projects/blenderModel/README.md","/Users/sunqi/projects/blenderModel/docs/code…(共 152 字符) is_error=False
+    [流] 工具结果 [{'type': 'text', 'text': '   1→"""SDK 消息流调试／展示公共函数。\n   2→\n   3→放在 cases/_common/ 下，与编号案例分开。案例按路径运行时 cases/ 会进入\n   4→…(共 2474 字符) is_error=False
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/README.md'}
+    [流] 工具调用 Grep {'pattern': '难度', 'path': '/Users/sunqi/projects/blenderModel', 'output_mode': 'content', '-n': True}
+    [流] 工具结果 [{'type': 'text', 'text': '   1→# blenderModel\n   2→\n   3→CodeBuddy Agent SDK 的调研笔记与由浅入深的 Python 教学案例。\n   4→\n   5→> …(共 2856 字符) is_error=False
+    [流] 工具结果 [{'type': 'text', 'text': '["/Users/sunqi/projects/blenderModel/docs/codebuddy-agent-sdk-tutorial.md:57:难度：★☆☆☆☆","/User…(共 1687 字符) is_error=False
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/08_subagents.py'}
+    [流] 工具结果 [{'type': 'text', 'text': '   1→"""\n   2→案例 08 · 自定义子 Agent：AgentDefinition\n   3→\n   4→难度：★★★★☆\n   5→目标：\n   6→  1. …(共 9772 字符) is_error=False
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/docs/codebuddy-agent-sdk-tutorial.md', 'offset': 40, 'limit': 50}
+    [流] 工具结果 [{'type': 'text', 'text': '  40→## 三、课程大纲（由浅入深）\n  41→\n  42→1. **Hello, query()** — 消息流、3 类消息、`CodeBuddyAgentOptions` 初…(共 1706 字符) is_error=False
+    [回答] **难度：★☆☆☆☆（1/5 星，最低档）**，见 `cases/01_hello_query.py:4`，教程文档 `docs/codebuddy-agent-sdk-tutorial.md:57` 也一致。\n\n为什么是这个星级：\n\n- 它是课程大纲 10 步里的第 1 步（"Hello, query()"），目标只是跑通一次最…(共 539 字符)
+    [结果] subtype=success session_id=01a1c3ef-d6e9-77cb-ad77-b62d14ece801 is_error=False errors=None
+    [判据] ToolUseBlock=8 其中 Agent 工具=0
+    [判据] (c) 未注册时不会委派到自定义子代理：通过 ✓  命中=0
+
+=== 要点 ===
+  · agents: dict[str, AgentDefinition] | None；key 是子代理名，
+    主 Agent 用 Agent 工具的 subagent_type 指定要委派给谁。
+  · AgentDefinition(description, prompt, tools, disallowed_tools, model)：
+    description 里写 'MUST BE USED' 能提高被主动选用的概率。
+  · tools 省略 → 继承主线程全部工具；指定 → 白名单。
+    disallowed_tools 在线上被映射成 disallowedTools（_protocol.py）。
+  · model 省略 / 'inherit' / 'default' 都不强制具体模型。
+  · agents 与 hooks 一样走 initialize 控制协议（_internal/query.py:107），
+    不是 CLI 参数；setting_sources=None 关不掉它。
+  · 与案例 02 的对照：文件型子代理放在 .codebuddy/agents/ 下，
+    需要 setting_sources 才会加载；程序化 agents 始终生效。
+  · 坑：不提供 can_use_tool 时 SDK 一律回 allowed=False（案例 06）。
+    子代理的工具请求也走同一个回调，所以本例挂了放行型 allow_all。
+```
+
+### 五个实测结论
+
+1. **注册是否生效，判据是 `Agent` 工具的 `subagent_type`，不是 `init.data`**：实测 `SystemMessage(init).data` 的 keys 里根本没有 `agents`（只有 `__timestamp` / `apiKeySource` / `cwd` / `mcp_servers` / `model` / `output_style` / `permissionMode` / `session_id` / `slash_commands` / `subtype` / `tools` / `type` / `uuid`），所以代码里 `if "agents" in data` 一次也没打印。A/B 场景各出现 1 次 `Agent` 工具调用，入参 `{"description", "prompt", "subagent_type": "case-reader", "name": "case-reader"}`，判据 (a)(b) 都通过。
+2. **显式委派能稳定命中指定子代理**：`description` 里写 `MUST BE USED`，配合 prompt 点名 `subagent_type`，两个不同的 key 分别被选中，说明 `dict` 里多个 `AgentDefinition` 是各自独立生效的。
+3. **子代理默认后台 spawn，主 `query()` 可能在它完成前就返回**：`Agent` 工具返回 `Spawned successfully. agent_id: case-reader@_auto_...`，模型随后用 `TaskOutput(block=True)` 只拿到 `Status: running`，主流程就返回 `subtype=success`，最终回答是「正在后台…我会在收到结果后向你汇报」。**不能把 `ResultMessage` 当成「子代理已完成」**——要拿最终报告得继续 `TaskOutput` 轮询或接后台任务通知。这是本例最容易踩的坑。
+4. **`tools` 白名单划分了能力边界，且子代理的工具调用会出现在父消息流里**：`case-counter` 定义成 `tools=["Bash"]`，实测主流里出现 `[流] 工具调用 Bash {'command': 'wc -l cases/07_hooks.py'}`、`[权限] 放行 Bash`，随后 `299 cases/07_hooks.py` 的结果块也回来了。案例 06 的 `can_use_tool` 对子代理同样生效，所以本例挂了放行型回调。另外 A/B 场景流里出现多条 `SystemMessage(init)`，是子代理独立会话的痕迹。
+5. **不注册 `agents` 时无法委派到自定义子代理**：C 场景问同样的问题，`Agent 工具=0`，主 Agent 自己用 Read / Glob / Grep 完成，判据 (c) 通过。程序化 `agents` 来自 `options` 而非文件配置，与案例 02 的 `setting_sources` 正好对照。
+
+### 验证陷阱
+
+- **不要用 `init.data` 判断注册**（见结论 1），也不要靠模型「有没有答对」当判据（案例 04/05 的教训）。本例 `verify()` 只读本地收集的 `ToolUseBlock`，找 `name == "Agent"` 且 `subagent_type` 命中注册名。
+- **不要把 `ResultMessage(subtype=success)` 当成子代理已完成**（见结论 3）。
+- **对照场景不是严格同 prompt**：C 为了不把自定义子代理名喂给模型，改成了不点名的问法；它证明的是「未注册时不会出现 `case-reader` / `case-counter` 的委派」，不是「同 prompt 下的行为差异」。
+- **`tools` 省略会继承主线程全部工具**，别误以为是白名单；`model` 省略 / `inherit` / `default` 也都不强制具体模型。
+- **记得挂 `can_use_tool`**：案例 06 的坑在这里同样适用，而且子代理的工具请求也走同一个回调。
+
+### 思考题
+
+- 把 `AgentDefinition.tools` 整个去掉，观察子代理是否继承主线程全部工具。
+- 用 `model="lite"` / `"inherit"` 观察子代理的模型解析链。
+- 改用 `disallowed_tools` 做黑名单，对照线上 key `disallowedTools`。
+- 针对结论 3：用 `TaskOutput` 轮询到 `completed`，或接后台任务通知，真正把子代理的最终报告取回来。
+- 在 `setting_sources=["project"]` 下放一个 `.codebuddy/agents/*.md` 文件型子代理，与 `options.agents` 对比优先级（案例 02 的延伸）。
+
+---
+
 ## 环境信息
 
 | 项 | 值 |
@@ -1261,4 +1446,4 @@ uv run python cases/07_hooks.py
 
 ## 下一步
 
-案例 8：自定义子 Agent——`AgentDefinition`。
+案例 9：自定义工具——`@tool` + `create_sdk_mcp_server` / 外部 MCP。
