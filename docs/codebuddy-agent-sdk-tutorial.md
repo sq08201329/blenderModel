@@ -45,7 +45,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 4. 多轮对话：`CodeBuddySDKClient` + `receive_response` ← 案例 04
 5. 会话持久化：`session_id` / `resume` / `continue_conversation` ← 案例 05
 6. 权限控制：`can_use_tool` 白名单与危险命令拦截 ← 案例 06
-7. Hook 系统：`PreToolUse` 审计与阻断
+7. Hook 系统：`PreToolUse` 审计与阻断 ← 案例 07
 8. 自定义子 Agent：`AgentDefinition`
 9. 自定义工具：`@tool` + `create_sdk_mcp_server` / 外部 MCP
 10. 综合实战：批量代码审查 CLI（流式输入、中断、错误处理、成本统计）
@@ -1067,6 +1067,189 @@ uv run python cases/06_permission_control.py
 
 ---
 
+## 案例 07 · Hook 系统：PreToolUse 审计与阻断
+
+难度：★★★★☆
+目标：拿到 Hook 的类型全貌、用 `PreToolUse` 做执行前审计、用 `decision="block"` 拦截命令、用 `matcher` 限定作用范围，并分清 Hook 层与案例 06 `can_use_tool` 权限层的分工。
+
+可运行文件：[`cases/07_hooks.py`](../cases/07_hooks.py)。本例发起 3 次真实模型调用；所有 Bash 命令均为无害的 `echo`，危险命令在工具执行前被 Hook 拦截，不会真正运行。
+
+### 知识点：Hook 与权限回调的分层
+
+`CodeBuddyAgentOptions.hooks` 的类型是 `dict[HookEvent, list[HookMatcher]] | None`（源码 `types.py:623`）。三块积木：
+
+| 类型 | 定义 | 要点 |
+|---|---|---|
+| `HookEvent` | `types.py:90-102`，11 个字符串 Literal | `PreToolUse` `PostToolUse` `PostToolUseFailure` `UserPromptSubmit` `Stop` `SubagentStop` `PreCompact` `PostCompact` `Notification` `SubagentStart` `PermissionRequest`；**Python 没有 `HOOK_EVENTS` 常量**，那是 TypeScript 的 |
+| `HookMatcher` | `types.py:453-459` | `matcher`（工具名，支持正则；`None` / `"*"` / `""` 匹配全部）、`hooks: list[HookCallback]`、`timeout`（**秒**，TS 是毫秒） |
+| `HookCallback` | `types.py:447-450` | `async (hook_input: Any, tool_use_id, context: HookContext) -> HookJSONOutput`，**必须 `async`** |
+
+`HookJSONOutput`（`types.py:435-445`，等于 `SyncHookJSONOutput`）是 TypedDict，键为 `continue_` / `suppressOutput` / `stopReason` / `decision: "block"` / `reason`。注意是 **`continue_`** 不是 `continue`：`_internal/query.py:487-492` 的 `_execute_hook` 会 `await` 回调，并把 `continue_` 改写成控制协议里的 `continue`。常用返回：
+
+| 返回 | 效果 |
+|---|---|
+| `{"continue_": True}` | 放行 |
+| `{"decision": "block", "reason": "..."}` | 阻止本次工具调用（仅 `PreToolUse` 有意义） |
+| `{"continue_": False, "stopReason": "..."}` | 停止 |
+
+**注册方式与通道**。`hooks` 不是 CLI 参数：`transport/subprocess.py` 的 `_build_args()` 完全不序列化 `opts.hooks`。它由 `_protocol.py:61-97` 的 `build_hooks_config()` 编成 `{event: [{matcher, hookCallbackIds, timeout}]}`，随 `initialize` 控制请求发给 CLI（`_internal/query.py:91,104`），回调 id 形如 `hook_PreToolUse_0_0`；CLI 再用 `hook_callback` 控制请求回调本地 Python 函数。推论：**程序化 Hook 不受 `setting_sources` 影响**，案例 02 的「SDK 默认不加载文件配置」关不掉它——这是与案例 02 最值得对照的一点。
+
+**分层**（本例实测的 TRACE 顺序）：
+
+```
+模型发出 tool_use
+  → PreToolUse Hook（可 block / 可用 hookSpecificOutput.updatedInput 改写入参）
+  → can_use_tool 权限层（案例 06：PermissionResultAllow / PermissionResultDeny）
+  → 工具真正执行
+  → ToolResultBlock / PostToolUse
+```
+
+实测放行时 `PreToolUse` 会在权限判断前后各触发一次；被 `block` 时只触发一次并直接短路，权限层完全不参与（见结论 2）。
+
+| 维度 | PreToolUse Hook（案例 07） | `can_use_tool`（案例 06） |
+|---|---|---|
+| 注册 | `options.hooks` | `options.can_use_tool` |
+| 触发时机 | 工具执行前，且在权限层之前 | 工具执行前，权限判断时 |
+| 拦截 | `{"decision": "block"}` | `PermissionResultDeny(message=...)` |
+| 改写入参 | `hookSpecificOutput.updatedInput` | `PermissionResultAllow(updated_input=...)` |
+| 中断会话 | `continue_: False` | `interrupt=True` → 抛 `ExecutionError` |
+| 依赖 `permission_mode` | 否 | 是（`default` 才触发；`plan` / `bypassPermissions` 会跳过） |
+| 被拦后的表现 | 一条 `is_error=True` 的 `ToolResultBlock`，`ResultMessage` 仍是 `success` | `interrupt=True` 时 `query()` 直接抛异常 |
+| 通道 | 控制协议 `initialize` | 控制协议 `can_use_tool` 请求 |
+
+**坑速查**：
+
+| 坑 | 表现 | 正确写法 |
+|---|---|---|
+| 回调写成同步函数 | 被 `_execute_hook` 的 `await` 吞掉，工具像「没反应」 | `async def cb(hook_input, tool_use_id, context)` |
+| 写成 `{"continue": True}` | Python 里 `continue` 是关键字，且控制协议的键由 SDK 改写 | `{"continue_": True}` |
+| 以为 `setting_sources=None` 能关掉 Hook | Hook 照常触发 | 不注册 `hooks` 才会关闭 |
+| `timeout` 按毫秒填 | 超时被放大 1000 倍 | Python 单位是**秒** |
+| 以为 `matcher` 省略会不匹配 | 实测 `matcher=None` 匹配全部 | 显式写 `"Bash"` 限定范围 |
+| 找 `HOOK_EVENTS` 常量 | Python SDK 里不存在 | 直接写字符串 `"PreToolUse"` |
+
+> `HookCallback` 的首参类型是 `Any`。CLI 文档 `sdk-hooks.md:384-392` 给的输入 schema 是 `{"tool_name", "tool_input": {"command"}}`，但同文件 `:138-139` 的 Python 示例却写成扁平的 `input_data.get("command")`；实测 `raw hook_input` 还额外带 `hook_event_name` / `session_id` / `transcript_path` / `cwd` 等字段。本例的 `hook_command()` 因此兼容两种取法，并在首次回调把原始值打印出来定稿。
+
+### 代码
+
+完整可运行代码见 [`cases/07_hooks.py`](../cases/07_hooks.py)。这里只放最核心的几行示意（省略了日志、打印与权限回调）；下面的实测输出来自完整代码文件。
+
+**① 注册**：`hooks` 是 `dict[HookEvent, list[HookMatcher]]`，事件名是字符串，`matcher` 限定工具：
+
+```python
+hooks = {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[guard_cb])]}
+```
+
+**② 拦截与放行**：回调必须 `async`；返回 `{"continue_": True}` 放行、`{"decision": "block", ...}` 拦截。`continue_` 由 SDK 改写成控制协议里的 `continue`：
+
+```python
+async def guard_cb(hook_input, tool_use_id, context):
+    _, command = hook_command(hook_input)
+    if any(word in command for word in DANGEROUS):
+        return {"decision": "block", "reason": "危险命令被 PreToolUse 拦截"}
+    return {"continue_": True}
+```
+
+其余部分——`show_hook_types()` 零成本类型自省、`TRACE` 有序日志、`allow_all` 放行型权限回调、`verify()` 三条确定性判据——都在代码文件里。
+
+### 运行与实测输出
+
+```bash
+uv run python cases/07_hooks.py
+```
+
+```
+=== Hook 类型自省（不消耗模型调用）===
+  HookEvent（11 种）= PreToolUse, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, SubagentStop, PreCompact, PostCompact, Notification, SubagentStart, PermissionRequest
+  HookMatcher 字段 = matcher, hooks, timeout
+  HookJSONOutput 键 = continue_, suppressOutput, stopReason, decision, reason
+  HookCallback = async (hook_input: Any, tool_use_id, context: HookContext)
+    -> HookJSONOutput；HookContext 键 = signal
+  · Python 里没有 HOOK_EVENTS 常量（那是 TypeScript 的），事件名就是字符串。
+  · 键名是 continue_ 不是 continue；_execute_hook 会改写成线上的 continue。
+  · HookMatcher.timeout 单位是秒（TypeScript 是毫秒）。
+
+=== A：PreToolUse 执行前审计 ===
+    [Hook/PRE] 审计 Bash: echo AUDIT_OK
+    [Hook/PRE] raw hook_input = {'hook_event_name': 'PreToolUse', 'session_id': '01a1c0de-767e-7fab-a638-961245c8b713', 'transcript_path': '/Users/sunqi/.codebuddy/projects/Users-sunqi-projects-blenderModel/01a1c0de-767e-7fab-a638-961245c8b713.jsonl', 'cwd': '/Users/sunqi…(共 464 字符)
+    [流] 工具调用 Bash {'command': 'echo AUDIT_OK', 'description': 'Execute echo AUDIT_OK and show output'}
+    [权限] 放行 Bash（Hook 之后、执行之前）
+    [Hook/PRE] 审计 Bash: echo AUDIT_OK
+    [流] 工具结果 [{'type': 'text', 'text': 'Stdout: AUDIT_OK\n\nStderr: (empty)\nExit Code: 0\nSignal: (non…(共 95 字符) is_error=False
+    [回答] 已执行 `echo AUDIT_OK`，工具输出如下：\n\n```\nAUDIT_OK\n```\n\n- stdout: `AUDIT_OK`\n- stderr: （空）\n- 退出码: `0`
+    [结果] subtype=success session_id=01a1c0de-767e-7fab-a638-961245c8b713 is_error=False errors=None
+    [判据] hook=2 ToolUseBlock=1 ToolResultBlock=1
+    [判据] (a) PreToolUse 先于工具执行：通过 ✓  hook_seq=1 result_seq=5
+
+=== B：decision=block 拦截危险命令 ===
+    [Hook/PRE] 拦截 echo "rm -rf /tmp/case07_nonexistent"
+    [流] 工具调用 Bash {'command': 'echo "rm -rf /tmp/case07_nonexistent"', 'description': 'Print the string with…(共 97 字符)
+    [流] 工具结果 [{'type': 'text', 'text': 'Error: PreToolUse:Bash hook blocked this tool call: 危险命令被 PreTo…(共 139 字符) is_error=True
+    [回答] Bash 工具已被调用，但命令被 `PreToolUse:Bash` 钩子拦截，因此没有产生任何输出。\n\n- 实际执行的命令：`echo "rm -rf /tmp/case07_nonexistent"`\n- 结果：`Error: PreToolUse:Bash hook blocked this tool call: 危险命令被 …(共 364 字符)
+    [结果] subtype=success session_id=01a1c0de-9d98-7026-80d3-365cc6b24cb2 is_error=False errors=None
+    [判据] hook=1 ToolUseBlock=1 ToolResultBlock=1
+    [判据] (b) 被拦命令从未执行：通过 ✓  blocked=['chatcmpl-tool-984a6665c0bf3d1f'] 成功执行=[]
+
+=== C：matcher 只匹配 Bash ===
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/01_hello_query.py', 'limit': 10}
+    [流] 工具结果 [{'type': 'text', 'text': '   1→"""\n   2→案例 01 · Hello, query()\n   3→\n   4→难度：★☆☆☆☆\n  …(共 334 字符) is_error=False
+    [Hook/PRE] 命中 matcher=Bash 的回调，tool_name=Bash
+    [流] 工具调用 Bash {'command': 'echo MATCH_OK', 'description': 'Print MATCH_OK'}
+    [权限] 放行 Bash（Hook 之后、执行之前）
+    [Hook/PRE] 命中 matcher=Bash 的回调，tool_name=Bash
+    [流] 工具结果 [{'type': 'text', 'text': 'Stdout: MATCH_OK\n\nStderr: (empty)\nExit Code: 0\nSignal: (non…(共 95 字符) is_error=False
+    [回答] 已按要求依次使用两个工具：\n\n- **Read** 读取了 `cases/01_hello_query.py` 前 10 行（是「案例 01 · Hello, query()」的文档说明）。\n- **Bash** 执行 `echo MATCH_OK`，命令输出为：\n\n```\nMATCH_OK\n```\n\n退出码 0，标准错…(共 174 字符)
+    [结果] subtype=success session_id=01a1c0de-c4e8-7f79-b440-455ad7c72cd1 is_error=False errors=None
+    [判据] hook=2 ToolUseBlock=2 ToolResultBlock=2
+    [判据] (c) matcher 只作用于 Bash：通过 ✓  非 Bash 工具调用=1 其中命中 Hook=0
+
+=== 要点 ===
+  · hooks: dict[HookEvent, list[HookMatcher]]，事件名是字符串，
+    Python 没有 HOOK_EVENTS 常量（那是 TypeScript 的）。
+  · HookCallback 必须 async，签名 (hook_input, tool_use_id, context)；
+    同步函数会被 _execute_hook 的 await 吞掉，异常也会被吞成 continue=False。
+  · 返回 {'continue_': True} 放行；{'decision':'block','reason':...} 拦截 PreToolUse；
+    'continue_' 由 _internal/query.py:490 改写成线上的 'continue'。
+  · matcher 按工具名匹配（支持正则；None/'*'/'' 匹配全部）；timeout 单位是秒。
+  · hooks 走进程内控制协议的 initialize 请求，不是 CLI 参数：
+    transport/subprocess.py 完全不序列化 opts.hooks，所以 setting_sources=None
+    也关不掉程序化 Hook（对照案例 02 的环境隔离）。
+  · 分层：tool_use → PreToolUse Hook → can_use_tool 权限层 → 执行 → ToolResultBlock。
+    Hook 能 block/改写入参；案例 06 的 can_use_tool 用 PermissionResultDeny/Allow。
+  · 坑：不提供 can_use_tool 时 SDK 一律回 allowed=False（案例 06），
+    三个场景都挂了放行型回调，工具才会真正执行、Hook 的先后才可观测。
+```
+
+### 五个实测结论
+
+1. **`PreToolUse` 确实先于工具执行**：A 场景的 TRACE 顺序是 `hook(seq=1) → ToolUseBlock(2) → 权限(3) → hook(4) → ToolResultBlock(5)`，`hook_seq=1 < result_seq=5`，判据 (a) 通过。Hook 是本地 Python 回调，这条时序不依赖模型回答。
+2. **放行的 Bash 调用触发两次 `PreToolUse`，被拦的只触发一次，且权限层完全不参与**：A/C 里每次 Bash 各有 2 条 hook 记录，B 里只有 1 条；B 场景没有出现 `[权限] 放行`。结合放行时「hook → 权限 → hook → 结果」的顺序看，第一次 Hook 在权限判断前、第二次在执行前；一旦第一次就 `block`，整条链直接短路。
+3. **`decision: block` 不抛异常**：B 场景拿到的是一条 `is_error=True` 的 `ToolResultBlock`，内容为 `Error: PreToolUse:Bash hook blocked this tool call: 危险命令被 …`，而 `ResultMessage` 仍是 `subtype=success is_error=False errors=None`。这与案例 06 的 `PermissionResultDeny(interrupt=True)` 让 `query()` 直接抛 `ExecutionError` 完全不同。
+4. **拦截的判据要看 `is_error`，不能只看有没有 `ToolResultBlock`**：B 场景 `ToolResultBlock=1`，但成功执行集合为空、判据 (b) 通过——命令从未真正运行。这正是 `verify()` 把 `is_error=True` 的结果排除在「已执行」之外的原因；只看「有结果块」会得出相反结论。
+5. **`matcher` 按工具名过滤**：C 场景 `tools=["Read","Bash"]`，Read 的 `ToolUseBlock` 一次 Hook 都没触发，2 条 Hook 全是 `tool_name=Bash`，判据 (c) 通过。另外实测 `raw hook_input` 除了 `tool_name` 还带 `hook_event_name` / `session_id` / `transcript_path` / `cwd`，比 CLI 文档给出的 JSON schema 丰富。
+
+### 验证陷阱
+
+- **不要用「模型有没有答对」当判据**（案例 04/05 的教训）。本例 `verify()` 只读本地 `TRACE`：`hook` / `perm` / `stream` 三类带 `seq` 的记录。模型可能不调用工具，所以场景无 `ToolUseBlock` 时打印「跳过断言」而不是硬失败；有工具调用但 Hook 没触发时也会单独提示检查 `matcher`。
+- **`HookCallback` 首参是 `Any`**：CLI 文档 `sdk-hooks.md:384-392` 的 JSON schema 是嵌套 `tool_input.command`，同文件 `:138-139` 的 Python 示例却是扁平 `input_data.get("command")`，实测还多出会话上下文字段。别硬编码一种形状——用 `hook_command()` 兼容两种，并首次打印 raw 定稿。
+- **别把 `is_error=True` 的 tool_result 当成「命令执行过」**（见结论 4）。
+- **回调必须 `async`**：同步函数会被 `_execute_hook` 的 `await` 吞掉，异常也会被吞成 `{"continue": false, "stopReason": str(e)}`（`_internal/query.py:486-494`），表面上看只是「工具没跑」，很难排查。
+- **记得挂 `can_use_tool`**：案例 06 的坑在这里同样适用——不提供回调时 SDK 对所有权限请求回 `allowed=False`，放行场景的工具根本不会执行，也就无法用 `ToolResultBlock` 证明 Hook 的先后。本例三个场景都用了放行型 `allow_all`。
+
+### 安全说明
+
+沿用案例 06 的做法，用 `echo` 承载危险关键词（`echo "rm -rf /tmp/case07_nonexistent"`）：既能触发 `guard_cb` 的拦截规则，又保证即使 Hook 失效也不会执行任何破坏性命令。`PreToolUse` 在工具执行前触发，被拦命令根本不会运行；`max_turns=5` 防止模型反复重试跑飞。
+
+### 思考题
+
+- 把 `guard_cb` 的返回改成 `{"continue_": False, "stopReason": "..."}`，对比 `decision: block` 的表现差异。
+- 用 `hookSpecificOutput: {"hookEventName": "PreToolUse", "updatedInput": {...}}` 改写命令（CLI 文档 `sdk-hooks.md:474-504`），与案例 06 的 `PermissionResultAllow(updated_input=...)` 对照。
+- 在同一个 `hooks` 里加 `PostToolUse`，观察它相对 `ToolResultBlock` 的时序。
+- 把 `permission_mode` 改成 `bypassPermissions`，看 `can_use_tool` 与 `PreToolUse` 分别是否还触发（对照案例 06 的思考题）。
+- `matcher` 写成正则（如 `"Bash|Write"`）或 `"*"`，观察命中范围的变化。
+
+---
+
 ## 环境信息
 
 | 项 | 值 |
@@ -1078,4 +1261,4 @@ uv run python cases/06_permission_control.py
 
 ## 下一步
 
-案例 7：Hook 系统——`PreToolUse` 审计与阻断。
+案例 8：自定义子 Agent——`AgentDefinition`。
