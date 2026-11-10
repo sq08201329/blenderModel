@@ -39,6 +39,7 @@ cases/
   07_hooks.py                 # 案例 07：Hook 系统 / PreToolUse 审计与阻断
   08_subagents.py             # 案例 08：自定义子 Agent / AgentDefinition
   09_custom_tools.py          # 案例 09：自定义工具 / SDK MCP
+  10_batch_review.py          # 案例 10：批量代码审查 CLI（综合实战）
   _common/
     sdk_helpers.py         # 公共函数：format_message / dump_message / dump_stream / brief
 docs/
@@ -53,8 +54,8 @@ pyproject.toml / uv.lock   # UV 项目与锁定依赖
 
 ## 课程进度
 
-案例 **01–09** 已完成：消息流分层、`query()` 基础用法、Options 全景、`setting_sources` 环境隔离、工具白名单与只读分析、多轮对话、会话持久化、权限控制、Hook 系统（`PreToolUse` 审计与阻断）、自定义子 Agent（`AgentDefinition`）、自定义工具（SDK MCP）。
-案例 10（综合实战：批量代码审查 CLI）待补充，完整大纲见教程文档。
+案例 **01–10** 已完成：消息流分层、`query()` 基础用法、Options 全景、`setting_sources` 环境隔离、工具白名单与只读分析、多轮对话、会话持久化、权限控制、Hook 系统（`PreToolUse` 审计与阻断）、自定义子 Agent（`AgentDefinition`）、自定义工具（SDK MCP）、批量代码审查 CLI（流式输入、中断、错误处理、成本统计）。
+10 个案例全部完结，完整大纲与案例讲解见教程文档。
 
 ## 几个已验证的要点
 

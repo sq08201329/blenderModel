@@ -48,7 +48,7 @@ TypeScript 对照：`query({prompt, options}) → Query`（AsyncGenerator 扩展
 7. Hook 系统：`PreToolUse` 审计与阻断 ← 案例 07
 8. 自定义子 Agent：`AgentDefinition` ← 案例 08
 9. 自定义工具：`@tool` + `create_sdk_mcp_server` / 外部 MCP ← 案例 09
-10. 综合实战：批量代码审查 CLI（流式输入、中断、错误处理、成本统计）
+10. 综合实战：批量代码审查 CLI（流式输入、中断、错误处理、成本统计） ← 案例 10
 
 ---
 
@@ -1611,6 +1611,184 @@ uv run python cases/09_custom_tools.py
 
 ---
 
+## 案例 10 · 综合实战：批量代码审查 CLI
+
+难度：★★★★★
+目标：用 `AsyncIterable[dict]` 做流式输入并认识它「合并成一轮」的行为、用逐文件多轮实现真正的批量审查、用 `receive_messages()` 自己控制停止时机并演示 `interrupt()`、汇总 `num_turns` / `duration_ms` / `total_cost_usd` / token 用量。
+
+可运行文件：[`cases/10_batch_review.py`](../cases/10_batch_review.py)。本例发起 4 次真实模型调用 + 1 个零成本错误演示；可用命令行参数指定待审查文件：`uv run python cases/10_batch_review.py cases/01_hello_query.py ...`。
+
+### 知识点：四个主题与分层
+
+| 主题 | 用到的 API | 落点 |
+|---|---|---|
+| 流式输入 | `query(AsyncIterable[dict], session_id=...)` | `review_stream()` |
+| 中断 | `client.interrupt()` | `collect(..., interrupt_after=1)` |
+| 错误处理 | `CodeBuddySDKError` 异常树 / `ResultMessage.is_error` / 文件级跳过 | `scene_errors()` / `scene_batch()` |
+| 成本统计 | `num_turns` / `duration_ms` / `total_cost_usd` / `usage` | `summarize()` |
+
+**流式输入的 envelope**（`client.py:88-105`、`_internal/query.py:146-169`）：每个 dict 是一条 stream-json 的 user 消息，`session_id` 由 `query(..., session_id=...)` 统一补齐，不用自己填。
+
+```json
+{
+  "type": "user",
+  "session_id": "...",
+  "message": {"role": "user", "content": "..."},
+  "parent_tool_use_id": null
+}
+```
+
+| | `receive_messages()` | `receive_response()` |
+|---|---|---|
+| 停止 | **不自动停**，必须自己 break | 到 `ResultMessage` / `ErrorMessage` 自动返回 |
+| 错误 | 只给一条 `ErrorMessage` | `is_error` 时抛 `ExecutionError` |
+| 适用 | 后台任务通知、需要精细控制 | 常规一轮对话 |
+
+所以 `collect()` 准备了**三层停止兜底**：① 遇 `ResultMessage` / `ErrorMessage` break；② 消息上限 `limit`（A/B 80、C 40）；③ `asyncio.timeout(90)` 墙钟超时——中断后流可能一直挂着，光有上限不够。
+
+**错误处理三层**：文件级 `resolve_files()` 跳过不存在的路径 → 每轮 `try/except CodeBuddySDKError` 让单文件失败不打断整批 → 汇总里展示 `ResultMessage.is_error` / `errors`。
+
+| 成本字段 | 含义 |
+|---|---|
+| `num_turns` | 本轮对话轮数 |
+| `duration_ms` / `duration_api_ms` | 墙钟耗时 / API 耗时 |
+| `total_cost_usd` | 费用（**本环境实测恒为 0.0**） |
+| `usage.input_tokens` / `output_tokens` | token 用量 |
+| `is_error` / `errors` | 失败判定 |
+
+**坑速查**：
+
+| 坑 | 表现 | 正确做法 |
+|---|---|---|
+| 用流式输入做逐个独立审查 | 连续多条 user message 被合并成一轮，只处理了一个 | 逐文件 `query(str)` 多轮 |
+| `receive_messages()` 不 break | 流一直挂着 | 三层兜底 |
+| 中断后立刻 `disconnect()` | 收不到收尾消息与 `ResultMessage` | 继续收到 `ResultMessage` 再退出 |
+| 只看 `total_cost_usd` | 本环境全 0，无法区分任务 | 看 turns / tokens / duration |
+| 既没 `allowed_tools` 也没 `can_use_tool` | 工具被一律拒绝（案例 06） | `allowed_tools` 静态放行或挂回调 |
+| 单文件异常没兜住 | 整批中断 | 每轮单独 try/except |
+
+### 代码
+
+完整可运行代码见 [`cases/10_batch_review.py`](../cases/10_batch_review.py)。这里只放最核心的两处（省略了 `collect()` 的三层兜底、汇总与 `explain()`）：
+
+```python
+# ① 流式输入：一次投递 N 条 user message（注意会被合并成一轮）
+async def review_stream(paths):
+    for i, path in enumerate(paths, 1):
+        yield {"type": "user",
+               "message": {"role": "user", "content": f"【审查任务 {i}】{review_prompt(path)}"},
+               "parent_tool_use_id": None}
+
+await client.query(review_stream(files), session_id="batch-review")
+
+# ② 真正批量：同一个 Client 内逐文件多轮，各轮独立收 ResultMessage
+for path in files:
+    await client.query(review_prompt(path))
+    stats = await collect(client)     # collect 用 receive_messages() 自己 break
+```
+
+`collect()` 的三层停止兜底、`interrupt()` 的触发时机、四条 `ResultMessage` 的汇总与零成本错误演示都在代码文件里。
+
+### 运行与实测输出
+
+```bash
+uv run python cases/10_batch_review.py
+```
+
+```
+=== API 自省（不消耗模型调用）===
+  CodeBuddySDKClient: connect / query / receive_messages /
+    receive_response / interrupt / set_model / disconnect
+  query(prompt: str | AsyncIterable[dict], session_id='default')
+    → 传异步可迭代对象就是「流式输入」，逐条写 stdin。
+  receive_messages() 不自动停，必须自己 break（案例 04 :534）。
+  receive_response() 到 ResultMessage 自动停；is_error 时抛 ExecutionError。
+  ResultMessage 统计字段 = num_turns, duration_ms, duration_api_ms,
+    total_cost_usd, usage(input_tokens/output_tokens), is_error, errors
+  异常树 = CodeBuddySDKError → CLIConnectionError / CLINotFoundError /
+    CLIStartupError / CLIJSONDecodeError / ProcessError / ExecutionError /
+    AuthenticationError
+
+=== A：流式输入（AsyncIterable[dict]）===
+  一次投递 2 条审查任务
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/03_readonly_analysis.py'}
+    [回答] 最严重的问题在第 91–94 行：白名单校验只比对模型实际调用的工具名，一旦 Agent 未调用任何工具（或调用被拦截/报错）导致 `used` 为空时，`set(used) <= WHITELIST` 恒成立而误报「通过 ✓」，且校验依据是硬编码的 `WHITELIST` 而非 `options`…(共 174 字符)
+    [判据] 投递=2 工具调用=1 收到消息=10
+    [判据] (a) 流式输入全部送达且拿到 ResultMessage：通过 ✓
+
+=== B：逐文件批量审查 ===
+  -- 审查 01_hello_query.py --
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/01_hello_query.py'}
+    [回答] 最严重的问题是 `permission_mode="plan"`——plan 并非注释所称的「只读模式」，而是让模型只输出计划、不直接作答，会使这个无需任何工具的纯问答拿不到预期的「一句话解释」文本，令演示 `TextBlock` 的分支形同虚设、直接违背案例目标。
+  -- 审查 03_readonly_analysis.py --
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases/03_readonly_analysis.py'}
+    [回答] 最严重的是 `permission_mode="plan"`：它与本例「让 Agent 真正调用工具完成任务」的核心目标正面冲突——plan 是让模型只做规划、不执行任务的模式（并非注释误称的「只读模式、双保险」），一次性 `query()` 中模型给出计划后便因无人批准而结束，三项只读分析与汇总不…(共 211 字符)
+    [判据] (b) 2/2 个文件独立完成审查：通过 ✓
+
+=== C：中途中断 ===
+    [中断] 已调用 client.interrupt()
+    [回答] I'll start by exploring the `cases/` directory. Since I need to use the Read tool, let me first try reading the directory path directly.
+    [流] 工具调用 Read {'file_path': '/Users/sunqi/projects/blenderModel/cases'}
+    [回答] Interrupted by user
+    [判据] 收到消息=8 工具调用=1 已中断=True
+    [判据] (c) 主动中断被执行：通过 ✓
+
+=== D：错误处理（零成本） ===
+    [异常] CLIConnectionError: Not connected. Call connect() first.
+    [判据] (d) 未连接调用被异常树兜住：通过 ✓
+
+=== 汇总 ===
+  A 流式: turns=6 耗时=29338ms 费用=$0.000000 tokens=10232/2142 is_error=False
+  B/01_hello_query.py: turns=6 耗时=62201ms 费用=$0.000000 tokens=10034/4912 is_error=False
+  B/03_readonly_analysis.py: turns=12 耗时=77433ms 费用=$0.000000 tokens=32304/11482 is_error=False
+  C 中断: turns=5 耗时=14900ms 费用=$0.000000 tokens=4471/1169 is_error=False
+  ---- 合计: turns=29 耗时=183872ms 费用=$0.000000 tokens=57041/19705
+  跳过的不存在文件 = 无
+  · 单文件失败只记入跳过列表，不影响其余文件；成本从各 ResultMessage 累加。
+  D 错误演示捕获 = CLIConnectionError: Not connected. Call connect() first.
+
+=== 要点 ===
+  · 流式输入：query(AsyncIterable[dict])，每个 dict 是一条 stream-json user 消息；
+    连续多条会被 CLI 合并成同一轮，适合「一次投递」，不适合逐个独立审查。
+  · 真正的批量：同一个 Client 内逐文件 query(str) 多轮，每轮各自收 ResultMessage；
+    单文件 try/except CodeBuddySDKError 兜住，失败不打断整批。
+  · receive_messages() 不自动停：自己 break（ResultMessage / ErrorMessage），
+    再加消息上限与墙钟超时，否则中断后流会一直挂着。
+  · receive_response() 到 ResultMessage 自动停，但 is_error 时会抛 ExecutionError。
+  · interrupt() 发控制请求打断当前回合，不靠模型自己停。
+  · 成本口径：total_cost_usd / num_turns / duration_ms / usage；逐条累加，
+    本环境 total_cost_usd 恒为 0，实际看 turns 与 tokens 更靠谱。
+  · 错误处理三层：文件级跳过 → SDK 异常树兜底 → ResultMessage.is_error 检查。
+  · tools 限定可见工具，allowed_tools 静态放行，can_use_tool 运行时兜底（案例 03/06）。
+```
+
+### 五个实测结论
+
+1. **流式输入把连续多条 user message 合并成一轮**：A 场景本地 `SENT` 记录投递了 2 条，但模型只调用了 1 次 `Read`（`03_readonly_analysis.py`）、只给出 1 个文件的结论，`turns=6`。所以 `AsyncIterable[dict]` 适合「一次投递」，**不适合逐个独立审查**——这是本例第一版实现的真实缺陷，改成逐文件多轮后才修好。
+2. **真正的批量要用同一个 Client 内逐文件多轮**：B 场景 2 个文件各自触发 1 次 `Read`、给出不同结论、各自拿到 `ResultMessage`（`turns=6` 与 `turns=12`），判据 (b) `2/2` 通过。这是案例 04「`query()` 每次都是新会话，多轮靠 Client」的直接应用。
+3. **`receive_messages()` 不自动停，中断后还会继续来消息**：C 场景 `[中断]` 打印后，流里仍出现 `[回答]`、`[流] 工具调用 Read`、`[回答] Interrupted by user`，最后才到 `ResultMessage`。所以 `collect()` 必须同时具备三个兜底：遇 `ResultMessage`/`ErrorMessage` break、消息上限、`asyncio.timeout(90)` 墙钟超时。
+4. **`total_cost_usd` 在本环境恒为 0，成本要看 turns / tokens / 耗时**：四条 `ResultMessage` 的 `total_cost_usd` 全是 `0.0`，汇总 `$0.000000`；真正有区分度的是 `num_turns`（合计 29）、`duration_ms`（合计 183872ms）、`usage`（57041 / 19705 tokens）。批量统计必须逐条累加，不能只看最后一次。
+5. **三层错误处理都落地，且 `allowed_tools` 绕开了案例 06 的坑**：文件级 `resolve_files()` 跳过不存在的路径、`scene_batch()` 里 `try/except CodeBuddySDKError` 单文件失败继续、汇总展示 `ResultMessage.is_error`；D 场景零成本用未连接调用触发 `CLIConnectionError: Not connected. Call connect() first.` 验证异常树。全程没有 `[权限]` 打印，说明 `allowed_tools=["Read"]` 静态放行生效，`can_use_tool` 只是没被触发的兜底。
+
+### 验证陷阱
+
+- **别把流式输入当成「批量」**：多条连续 user message 会合并成一轮（结论 1），要逐个独立审查必须用逐文件 `query(str)` 多轮。
+- **`receive_messages()` 不自动停**；`receive_response()` 会自动停，但 `is_error` 时抛 `ExecutionError`，两种停止语义别混用。
+- **中断后不要立刻 `disconnect()`**，否则收不到 `Interrupted by user` 与收尾的 `ResultMessage`（结论 3）。
+- **成本别只看 `total_cost_usd`**（本环境为 0）；批量任务逐条累加 turns / tokens / duration。
+- **批量耗时不短**：本例 4 次调用合计约 184 秒，跑之前确认认证可用与预算。
+- 模型给出的审查结论只是演示输出，不是本教程对这些文件的定论；判据一律来自本地记录（`SENT`、`stats`、异常对象）。
+
+### 思考题
+
+- 把 B 场景的 `collect()` 换成 `receive_response()`，对比停止行为与异常处理差异。
+- 给 `review_prompt` 加结构化输出要求（JSON），把审查结论落成报告文件。
+- 去掉 `asyncio.timeout(90)` 只留消息上限，观察中断场景下会不会挂住。
+- 用 `set_model()` / `set_permission_mode()` 在批量中途动态切换（案例 04 / 10 的 Client API 延伸）。
+- 把案例 06 的 `can_use_tool` 拦截、案例 07 的 Hook 审计加进流水线，做带审计的批量审查。
+
+---
+
 ## 环境信息
 
 | 项 | 值 |
@@ -1620,6 +1798,13 @@ uv run python cases/09_custom_tools.py
 | SDK | 项目约束 `>=0.3.299`，`uv.lock` 锁定 0.3.299 |
 | CLI | `/usr/local/bin/codebuddy` |
 
-## 下一步
+## 小结与延伸
 
-案例 10：综合实战——批量代码审查 CLI（流式输入、中断、错误处理、成本统计）。
+案例 01–10 已全部完成，覆盖消息流、Options 与环境隔离、工具白名单、多轮对话、会话持久化、权限回调、Hook、子 Agent、自定义工具（SDK MCP）与批量审查 CLI。
+
+后续可延伸的方向：
+
+- 把案例 10 的审查结论落成结构化报告（JSON / Markdown），接进 CI。
+- 用 `CodeBuddySDKClient.set_model()` / `set_permission_mode()` 做运行时切换（案例 04 / 10 的 Client API 还有一半没实跑）。
+- 把案例 06 的 `can_use_tool` 拦截、案例 07 的 Hook 审计、案例 08 的子 Agent 组合成带审计的自动化流水线。
+- 补上外部 MCP（stdio / http）、`mcp_server_status()`、后台任务通知与 `resume` 的错误分支（见各课思考题）。
